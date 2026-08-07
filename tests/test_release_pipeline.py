@@ -116,6 +116,34 @@ class ReleasePipelineTests(unittest.TestCase):
             tag = pilot_and_promote.resolve_previous_proven_tag(settings, "token", statement)
         self.assertEqual(tag, "v26.7.28-vpnbot.3")
 
+    def test_remote_version_keeps_capability_lines(self) -> None:
+        settings = pilot_and_promote.Settings(
+            releases_url="https://forgejo.invalid/releases",
+            token_file=Path("/token"),
+            canary_node="canary",
+            canary_host="127.0.0.1",
+            canary_port=10222,
+            canary_user="root",
+            identity_file=Path("/key"),
+            known_hosts_file=Path("/known_hosts"),
+            updater_path="/usr/local/bin/vpnbot-xray-core-updater",
+            xray_path="/opt/vpnbot/xray-core/bin/xray",
+            config_dir="/opt/vpnbot/xray-core/config",
+            service_name="vpnbot-xray.service",
+            state_dir=Path("/state"),
+            canary_script=Path("/canary.py"),
+            timeout_seconds=900,
+        )
+        output = (
+            b"Xray 26.7.28 (Xray, Penetrates Everything.) 0d9b32c (go1.26.4 linux/amd64)\n"
+            b"VPnBot capability: vpnbot-active-revoke-v3\n"
+        )
+        completed = __import__("subprocess").CompletedProcess([], 0, output, b"")
+        with mock.patch.object(pilot_and_promote, "remote_command", return_value=completed):
+            statement, tag = pilot_and_promote.remote_version(settings)
+        self.assertEqual(tag, "v26.7.28")
+        self.assertIn(release_pipeline.CAPABILITY, statement)
+
 
 if __name__ == "__main__":
     unittest.main()

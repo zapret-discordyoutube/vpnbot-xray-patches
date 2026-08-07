@@ -167,7 +167,7 @@ def remote_version(settings: Settings) -> tuple[str, str]:
     match = re.search(r"\bXray\s+([0-9]+(?:\.[0-9]+){2}(?:-[A-Za-z0-9_.-]+)?)", first_line)
     if not match:
         raise release_pipeline.PipelineError(f"cannot parse canary Xray version: {first_line}")
-    return first_line, f"v{match.group(1)}"
+    return output, f"v{match.group(1)}"
 
 
 def updater(settings: Settings, tag: str, channel: str) -> str:
