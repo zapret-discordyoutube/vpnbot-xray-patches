@@ -30,13 +30,15 @@ jobs:
         run: |
           set -euo pipefail
           apt-get update
-          apt-get install -y --no-install-recommends ca-certificates curl git openssl zip
+          apt-get install -y --no-install-recommends ca-certificates curl git openssl python3 unzip zip
 
       - name: Validate the repository boundary
         run: |
           set -euo pipefail
           git diff --check -- . ':!patches/*.patch'
-          bash -n scripts/prepare-source.sh scripts/test-patches.sh scripts/build-release.sh
+          bash -n scripts/prepare-source.sh scripts/test-patches.sh scripts/build-release.sh scripts/install_promoter.sh
+          python3 -m py_compile scripts/release_pipeline.py scripts/canary_active_revoke.py scripts/pilot_and_promote.py
+          python3 -m unittest discover -s tests -p 'test_*.py'
           test "$(find patches -maxdepth 1 -type f -name '*.patch' | wc -l)" -eq 3
           if git grep -n -I -E -- 'git\.zapret\.moe/.+Xray-core|github\.com/(youtubediscord|zapretdiscordyoutube)/Xray-core'; then
             echo 'A retired full Xray fork is referenced' >&2

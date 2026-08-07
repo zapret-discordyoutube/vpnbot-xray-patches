@@ -16,3 +16,6 @@ go test -timeout 30m \
     ./proxy/trojan \
     ./proxy/vmess/inbound \
     ./proxy/shadowsocks
+
+go test -timeout 30m ./testing/scenarios \
+    -run 'TestCommanderRemove(Trojan|VMess|Shadowsocks)UserInterrupts'

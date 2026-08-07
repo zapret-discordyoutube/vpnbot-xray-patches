@@ -6,8 +6,13 @@ readonly SCRIPT_DIR
 REPOSITORY_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"
 readonly REPOSITORY_ROOT
 
+BUILD_ENV_FILE="${VPNBOT_BUILD_ENV_FILE:-${REPOSITORY_ROOT}/upstream.env}"
+[[ -f "$BUILD_ENV_FILE" && ! -L "$BUILD_ENV_FILE" ]] || {
+    printf 'build-release: build environment is not a regular file: %s\n' "$BUILD_ENV_FILE" >&2
+    exit 1
+}
 # shellcheck source=../upstream.env
-source "${REPOSITORY_ROOT}/upstream.env"
+source "$BUILD_ENV_FILE"
 
 fail() {
     printf 'build-release: %s\n' "$*" >&2
@@ -22,7 +27,7 @@ require_command() {
 readonly OUTPUT_ARGUMENT="$1"
 [[ -n "$OUTPUT_ARGUMENT" && "$OUTPUT_ARGUMENT" != / ]] || fail "unsafe output directory"
 
-for command_name in curl git go openssl sha256sum touch zip find; do
+for command_name in curl git go openssl sha256sum touch unzip zip find; do
     require_command "$command_name"
 done
 
@@ -45,13 +50,27 @@ trap 'rm -rf -- "$TEMP_DIRECTORY"' EXIT HUP INT TERM
 readonly SOURCE_DIRECTORY="${TEMP_DIRECTORY}/xray"
 mkdir -p -- "${TEMP_DIRECTORY}/resources"
 
+[[ "${SOURCE_DATE_EPOCH:-}" =~ ^[0-9]{9,12}$ ]] \
+    || fail "invalid SOURCE_DATE_EPOCH: ${SOURCE_DATE_EPOCH:-<unset>}"
+
+official_asset_base="https://github.com/XTLS/Xray-core/releases/download/${XRAY_UPSTREAM_TAG}"
+official_archive="${TEMP_DIRECTORY}/official-Xray-linux-64.zip"
+official_digest="${official_archive}.dgst"
+curl --fail --location --silent --show-error \
+    --connect-timeout 15 --max-time 300 --retry 3 --retry-all-errors \
+    "${official_asset_base}/Xray-linux-64.zip" --output "$official_archive"
+curl --fail --location --silent --show-error \
+    --connect-timeout 15 --max-time 180 --retry 3 --retry-all-errors \
+    "${official_asset_base}/Xray-linux-64.zip.dgst" --output "$official_digest"
+official_sha256="$(awk '$1 == "SHA2-256=" && length($2) == 64 {print tolower($2); exit}' "$official_digest")"
+[[ "$official_sha256" =~ ^[0-9a-f]{64}$ ]] \
+    || fail "official Xray digest does not contain a standalone SHA-256"
+printf '%s  %s\n' "$official_sha256" "$official_archive" | sha256sum --check --status - \
+    || fail "official Xray archive SHA-256 mismatch"
+unzip -j -q "$official_archive" geoip.dat geosite.dat -d "${TEMP_DIRECTORY}/resources"
 for asset in geoip geosite; do
-    curl --fail --location --silent --show-error \
-        --connect-timeout 15 --max-time 180 --retry 3 --retry-all-errors \
-        "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/${asset}.dat" \
-        --output "${TEMP_DIRECTORY}/resources/${asset}.dat"
     [[ -s "${TEMP_DIRECTORY}/resources/${asset}.dat" ]] \
-        || fail "downloaded ${asset}.dat is empty"
+        || fail "official ${asset}.dat is empty"
 done
 
 build_target() {
@@ -78,7 +97,7 @@ build_target() {
     cp -- "${SOURCE_DIRECTORY}/LICENSE" "${package_directory}/LICENSE"
     cp -- "${TEMP_DIRECTORY}/resources/geoip.dat" "${package_directory}/geoip.dat"
     cp -- "${TEMP_DIRECTORY}/resources/geosite.dat" "${package_directory}/geosite.dat"
-    touch -d '2026-07-28 00:00:00 UTC' "${package_directory}"/*
+    touch -d "@${SOURCE_DATE_EPOCH}" "${package_directory}"/*
 
     (
         cd "$package_directory"

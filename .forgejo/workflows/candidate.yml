@@ -1,0 +1,90 @@
+name: Follow official Xray dev releases
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: vpnbot-xray-official-release
+  cancel-in-progress: false
+
+jobs:
+  candidate:
+    runs-on: linux
+    timeout-minutes: 120
+    steps:
+      - name: Checkout the trusted main branch
+        uses: https://data.forgejo.org/actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install release prerequisites
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl git openssl python3 unzip zip
+
+      - name: Resolve the newest official Xray release
+        id: discover
+        run: |
+          set -euo pipefail
+          python3 scripts/release_pipeline.py discover \
+            --forgejo-releases-url "${FORGEJO_API_URL}/repos/${FORGEJO_REPOSITORY}/releases" \
+            --output-env candidate.env \
+            --output-metadata candidate-metadata.json
+          set -a
+          source candidate.env
+          set +a
+          printf 'action=%s\n' "$PIPELINE_ACTION" >> "$FORGEJO_OUTPUT"
+          printf 'go_version=%s\n' "$GO_VERSION" >> "$FORGEJO_OUTPUT"
+          cat candidate.env >> "$FORGEJO_ENV"
+
+      - name: Set up the official Go toolchain
+        if: steps.discover.outputs.action == 'build'
+        uses: https://data.forgejo.org/actions/setup-go@v6
+        with:
+          go-version: ${{ steps.discover.outputs.go_version }}
+          cache: false
+
+      - name: Apply patches and run revocation regressions
+        if: steps.discover.outputs.action == 'build'
+        env:
+          VPNBOT_BUILD_ENV_FILE: candidate.env
+        run: scripts/test-patches.sh
+
+      - name: Build the immutable candidate assets
+        if: steps.discover.outputs.action == 'build'
+        env:
+          VPNBOT_BUILD_ENV_FILE: candidate.env
+        run: |
+          set -euo pipefail
+          scripts/build-release.sh release-assets
+          python3 scripts/release_pipeline.py manifest \
+            --build-env candidate.env \
+            --assets-dir release-assets
+
+      - name: Publish or verify the candidate prerelease
+        if: steps.discover.outputs.action == 'build'
+        run: |
+          set -euo pipefail
+          python3 scripts/release_pipeline.py publish-candidate \
+            --forgejo-releases-url "${FORGEJO_API_URL}/repos/${FORGEJO_REPOSITORY}/releases" \
+            --assets-dir release-assets
+
+      - name: Upload the exact candidate as a short-lived Actions artifact
+        if: steps.discover.outputs.action == 'build'
+        uses: https://data.forgejo.org/forgejo/upload-artifact@v4
+        with:
+          name: vpnbot-xray-candidate
+          path: release-assets/
+          retention-days: 14
+
+      - name: Report an idempotent no-op
+        if: steps.discover.outputs.action == 'noop'
+        run: cat candidate-metadata.json

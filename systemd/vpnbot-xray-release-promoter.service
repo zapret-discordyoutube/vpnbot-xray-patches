@@ -1,0 +1,25 @@
+[Unit]
+Description=Pilot and promote a VPnBot Xray candidate
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/vpnbot-xray-release-promoter.env
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+EnvironmentFile=/etc/vpnbot-xray-release-promoter.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/local/libexec/vpnbot-xray-release-promoter/pilot_and_promote.py
+UMask=0077
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/vpnbot-xray-release-promoter
+NoNewPrivileges=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target

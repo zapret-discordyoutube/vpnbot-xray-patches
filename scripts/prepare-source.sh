@@ -6,8 +6,13 @@ readonly SCRIPT_DIR
 REPOSITORY_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"
 readonly REPOSITORY_ROOT
 
+BUILD_ENV_FILE="${VPNBOT_BUILD_ENV_FILE:-${REPOSITORY_ROOT}/upstream.env}"
+[[ -f "$BUILD_ENV_FILE" && ! -L "$BUILD_ENV_FILE" ]] || {
+    printf 'prepare-source: build environment is not a regular file: %s\n' "$BUILD_ENV_FILE" >&2
+    exit 1
+}
 # shellcheck source=../upstream.env
-source "${REPOSITORY_ROOT}/upstream.env"
+source "$BUILD_ENV_FILE"
 
 fail() {
     printf 'prepare-source: %s\n' "$*" >&2
@@ -32,6 +37,8 @@ done
     || fail "invalid upstream tag: $XRAY_UPSTREAM_TAG"
 [[ "$XRAY_UPSTREAM_COMMIT" =~ ^[0-9a-f]{40}$ ]] \
     || fail "invalid upstream commit: $XRAY_UPSTREAM_COMMIT"
+[[ "${VPNBOT_RELEASE_TAG:-}" =~ ^v[0-9]+([.][0-9]+){2}-vpnbot[.][0-9]+$ ]] \
+    || fail "invalid VPnBot proven release tag: ${VPNBOT_RELEASE_TAG:-<unset>}"
 
 if [[ -e "$DESTINATION" ]]; then
     [[ -d "$DESTINATION" && ! -L "$DESTINATION" ]] \

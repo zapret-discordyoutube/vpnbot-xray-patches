@@ -1,0 +1,12 @@
+[Unit]
+Description=Check for a new VPnBot Xray candidate
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=30min
+RandomizedDelaySec=5min
+Persistent=true
+Unit=vpnbot-xray-release-promoter.service
+
+[Install]
+WantedBy=timers.target
