@@ -1,0 +1,57 @@
+name: Test and build VPnBot Xray patches
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    runs-on: linux
+    timeout-minutes: 90
+    steps:
+      - name: Checkout the patch repository
+        uses: https://data.forgejo.org/actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up the Go version required by official Xray
+        uses: https://data.forgejo.org/actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          cache: false
+
+      - name: Install packaging tools
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl git openssl zip
+
+      - name: Validate the repository boundary
+        run: |
+          set -euo pipefail
+          git diff --check -- . ':!patches/*.patch'
+          bash -n scripts/prepare-source.sh scripts/test-patches.sh scripts/build-release.sh
+          test "$(find patches -maxdepth 1 -type f -name '*.patch' | wc -l)" -eq 3
+          if git grep -n -I -E -- 'git\.zapret\.moe/.+Xray-core|github\.com/(youtubediscord|zapretdiscordyoutube)/Xray-core'; then
+            echo 'A retired full Xray fork is referenced' >&2
+            exit 1
+          fi
+
+      - name: Apply and test the patches on official XTLS source
+        run: scripts/test-patches.sh
+
+      - name: Build Linux release archives
+        run: scripts/build-release.sh release-assets
+
+      - name: Upload the exact release candidates
+        uses: https://data.forgejo.org/forgejo/upload-artifact@v4
+        with:
+          name: vpnbot-xray-linux
+          path: release-assets/
+          retention-days: 7

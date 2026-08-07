@@ -1,0 +1,824 @@
+From 34a52e6029d76264fbe4fc31b5669b8a1600c351 Mon Sep 17 00:00:00 2001
+From: loop-uh <loop-uh@users.noreply.github.com>
+Date: Thu, 6 Aug 2026 01:35:03 +0300
+Subject: [PATCH 2/3] Interrupt active Trojan sessions on user removal
+
+---
+ VPNBOT_ACTIVE_REVOKE.md                       |  39 ++--
+ common/active_user_sessions.go                | 130 ++++++++++++
+ common/active_user_sessions_test.go           |  57 +++++
+ core/core.go                                  |   1 +
+ proxy/trojan/active_sessions_test.go          | 113 ++++++++++
+ proxy/trojan/server.go                        |  43 +++-
+ proxy/vless/inbound/inbound.go                | 100 ++-------
+ .../scenarios/trojan_active_revoke_test.go    | 195 ++++++++++++++++++
+ 8 files changed, 573 insertions(+), 105 deletions(-)
+ create mode 100644 common/active_user_sessions.go
+ create mode 100644 common/active_user_sessions_test.go
+ create mode 100644 proxy/trojan/active_sessions_test.go
+ create mode 100644 testing/scenarios/trojan_active_revoke_test.go
+
+diff --git a/VPNBOT_ACTIVE_REVOKE.md b/VPNBOT_ACTIVE_REVOKE.md
+index db57434b..d6b4c594 100644
+--- a/VPNBOT_ACTIVE_REVOKE.md
++++ b/VPNBOT_ACTIVE_REVOKE.md
+@@ -1,31 +1,38 @@
+-# VPnBot exact active VLESS revocation
++# VPnBot exact active VLESS and Trojan revocation
+ 
+ This fork carries one deliberately narrow behavior change for VPnBot-managed
+-VLESS users: a successful `HandlerService.RemoveUser` operation both removes
+-the UUID from the in-memory validator and interrupts the active transport
+-connections authenticated as that exact inbound email.
++VLESS and Trojan users: a successful `HandlerService.RemoveUser` operation both
++removes the credential from the in-memory validator and interrupts the active
++transport connections authenticated as that exact inbound email.
+ 
+ The capability is reported by `xray version` as:
+ 
+ ```text
+-VPnBot capability: vpnbot-active-revoke-v1
++VPnBot capability: vpnbot-active-revoke-v2
+ ```
+ 
+-VPnBot node installers and updaters must fail closed when this marker is absent.
++The version statement also retains the earlier
++`vpnbot-active-revoke-v1` marker as a backward-compatibility claim for VLESS.
++VPnBot node installers and updaters that require Trojan revocation must fail
++closed when the `v2` marker is absent.
+ 
+-The implementation keeps an active-session registry inside each VLESS inbound
+-handler. Registry admission and `AddUser`/`RemoveUser` mutations share one
+-mutex, so a connection authenticated before deletion cannot register after the
+-same email has been deleted or replaced. `RemoveUser` deletes the validator
+-entry before closing its captured sessions, which blocks new handshakes while
+-the old sessions are interrupted. A repeated removal remains idempotent and
+-retries closing any session whose handler has not yet unwound.
++The implementation uses one shared active-session registry primitive inside
++each VLESS and Trojan inbound handler. Registry admission and
++`AddUser`/`RemoveUser` mutations share one mutex, so a connection authenticated
++before deletion cannot register after the same email has been deleted or
++replaced. `RemoveUser` deletes the validator entry before closing its captured
++sessions, which blocks new handshakes while the old sessions are interrupted.
++A repeated removal remains idempotent and retries closing any session whose
++handler has not yet unwound.
+ 
+ The per-inbound registry prevents one inbound's mutation from touching another
+ inbound. The exact email key prevents one user's removal from closing another
+ user's active connection.
+ 
+ Regression coverage lives in
+-`proxy/vless/inbound/active_sessions_test.go`. Before a VPnBot release, the fork
+-must also pass the upstream VLESS scenarios and an external long-stream E2E for
+-every transport used by production: TCP, WebSocket, gRPC and XHTTP.
++`common/active_user_sessions_test.go`,
++`proxy/vless/inbound/active_sessions_test.go`, and
++`proxy/trojan/active_sessions_test.go`. Before a VPnBot release, the fork must
++also pass the upstream protocol scenarios and an external long-stream E2E for
++every transport used by production: VLESS TCP, WebSocket, gRPC and XHTTP, plus
++Trojan TCP.
+diff --git a/common/active_user_sessions.go b/common/active_user_sessions.go
+new file mode 100644
+index 00000000..9937b6e3
+--- /dev/null
++++ b/common/active_user_sessions.go
+@@ -0,0 +1,130 @@
++package common
++
++import (
++	"errors"
++	"strings"
++	"sync"
++)
++
++var (
++	// ErrActiveUserSessionsClosed is returned when a closed inbound is asked to
++	// accept another user or authenticated connection.
++	ErrActiveUserSessionsClosed = errors.New("active user session registry is closed")
++	// ErrActiveUserIdentityChanged is returned when the identity authenticated
++	// by a connection was removed or replaced before registration completed.
++	ErrActiveUserIdentityChanged = errors.New("authenticated user was removed or replaced")
++)
++
++// ActiveUserSessions serializes user mutations with admission of authenticated
++// connections and keeps the connections grouped by their normalized email.
++//
++// A protocol handler must perform AddUser and RemoveUser mutations through this
++// registry and must revalidate the authenticated account in Register. This
++// makes removal a barrier: after Revoke returns, an earlier authentication can
++// no longer join the active set, while every connection admitted before the
++// barrier is included in the returned snapshot.
++type ActiveUserSessions struct {
++	mu            sync.Mutex
++	byEmail       map[string]map[uint64]Closable
++	nextSessionID uint64
++	closed        bool
++}
++
++// NormalizeUserEmail returns the canonical active-session key.
++func NormalizeUserEmail(email string) string {
++	return strings.ToLower(strings.TrimSpace(email))
++}
++
++// MutateIfOpen runs a user addition while holding the same lock used by
++// Register and Revoke.
++func (r *ActiveUserSessions) MutateIfOpen(mutate func() error) error {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	if r.closed {
++		return ErrActiveUserSessionsClosed
++	}
++	return mutate()
++}
++
++// Revoke runs a user removal and atomically snapshots every active connection
++// registered for the same email. Snapshot entries intentionally remain in the
++// registry until their normal unregister callback runs, so a retry can attempt
++// interruption again if the first close reported an error.
++func (r *ActiveUserSessions) Revoke(email string, mutate func(normalizedEmail string) error) ([]Closable, error) {
++	email = NormalizeUserEmail(email)
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	err := mutate(email)
++	return r.sessionsForEmailLocked(email), err
++}
++
++// Register admits one authenticated connection only if stillCurrent confirms,
++// under the mutation lock, that the exact account is still installed.
++func (r *ActiveUserSessions) Register(email string, connection Closable, stillCurrent func(normalizedEmail string) bool) (func(), error) {
++	if connection == nil {
++		return func() {}, nil
++	}
++	email = NormalizeUserEmail(email)
++	if email == "" {
++		return func() {}, nil
++	}
++
++	r.mu.Lock()
++	if r.closed {
++		r.mu.Unlock()
++		return nil, ErrActiveUserSessionsClosed
++	}
++	if !stillCurrent(email) {
++		r.mu.Unlock()
++		return nil, ErrActiveUserIdentityChanged
++	}
++	if r.byEmail == nil {
++		r.byEmail = make(map[string]map[uint64]Closable)
++	}
++	byID := r.byEmail[email]
++	if byID == nil {
++		byID = make(map[uint64]Closable)
++		r.byEmail[email] = byID
++	}
++	r.nextSessionID++
++	sessionID := r.nextSessionID
++	byID[sessionID] = connection
++	r.mu.Unlock()
++
++	return func() {
++		r.mu.Lock()
++		if currentByID := r.byEmail[email]; currentByID != nil {
++			delete(currentByID, sessionID)
++			if len(currentByID) == 0 {
++				delete(r.byEmail, email)
++			}
++		}
++		r.mu.Unlock()
++	}, nil
++}
++
++// Close rejects future mutations and registrations and returns every currently
++// tracked connection for interruption by the protocol handler.
++func (r *ActiveUserSessions) Close() []Closable {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	var sessions []Closable
++	for email := range r.byEmail {
++		sessions = append(sessions, r.sessionsForEmailLocked(email)...)
++	}
++	r.byEmail = nil
++	r.closed = true
++	return sessions
++}
++
++func (r *ActiveUserSessions) sessionsForEmailLocked(email string) []Closable {
++	byID := r.byEmail[email]
++	if len(byID) == 0 {
++		return nil
++	}
++	sessions := make([]Closable, 0, len(byID))
++	for _, connection := range byID {
++		sessions = append(sessions, connection)
++	}
++	return sessions
++}
+diff --git a/common/active_user_sessions_test.go b/common/active_user_sessions_test.go
+new file mode 100644
+index 00000000..e9a83eee
+--- /dev/null
++++ b/common/active_user_sessions_test.go
+@@ -0,0 +1,57 @@
++package common
++
++import (
++	"errors"
++	"net"
++	"testing"
++)
++
++func TestActiveUserSessionsRevokeIsAdmissionBarrier(t *testing.T) {
++	var installed = "old"
++	var sessions ActiveUserSessions
++	server, client := net.Pipe()
++	defer client.Close()
++	unregister, err := sessions.Register(" User@Example.COM ", server, func(string) bool {
++		return installed == "old"
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer unregister()
++
++	connections, err := sessions.Revoke("user@example.com", func(string) error {
++		installed = ""
++		return nil
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(connections) != 1 || connections[0] != server {
++		t.Fatalf("unexpected revoke snapshot: %#v", connections)
++	}
++
++	lateServer, lateClient := net.Pipe()
++	defer lateServer.Close()
++	defer lateClient.Close()
++	if _, err := sessions.Register("user@example.com", lateServer, func(string) bool {
++		return installed == "old"
++	}); !errors.Is(err, ErrActiveUserIdentityChanged) {
++		t.Fatalf("late registration error = %v", err)
++	}
++}
++
++func TestActiveUserSessionsCloseRejectsFurtherUse(t *testing.T) {
++	var sessions ActiveUserSessions
++	if got := sessions.Close(); len(got) != 0 {
++		t.Fatalf("unexpected close snapshot: %#v", got)
++	}
++	if err := sessions.MutateIfOpen(func() error { return nil }); !errors.Is(err, ErrActiveUserSessionsClosed) {
++		t.Fatalf("mutation after close error = %v", err)
++	}
++	server, client := net.Pipe()
++	defer server.Close()
++	defer client.Close()
++	if _, err := sessions.Register("user@example.com", server, func(string) bool { return true }); !errors.Is(err, ErrActiveUserSessionsClosed) {
++		t.Fatalf("registration after close error = %v", err)
++	}
++}
+diff --git a/core/core.go b/core/core.go
+index 1e27833d..e0b0c14c 100644
+--- a/core/core.go
++++ b/core/core.go
+@@ -69,5 +69,6 @@ func VersionStatement() []string {
+ 		serial.Concat("Xray ", Version(), " (", codename, ") ", build, " (", runtime.Version(), " ", runtime.GOOS, "/", runtime.GOARCH, ")"),
+ 		intro,
+ 		"VPnBot capability: vpnbot-active-revoke-v1",
++		"VPnBot capability: vpnbot-active-revoke-v2",
+ 	}
+ }
+diff --git a/proxy/trojan/active_sessions_test.go b/proxy/trojan/active_sessions_test.go
+new file mode 100644
+index 00000000..26fcaec3
+--- /dev/null
++++ b/proxy/trojan/active_sessions_test.go
+@@ -0,0 +1,113 @@
++package trojan
++
++import (
++	"context"
++	"io"
++	stdnet "net"
++	"testing"
++
++	"github.com/xtls/xray-core/common/protocol"
++)
++
++func testTrojanMemoryUser(email, password string) *protocol.MemoryUser {
++	account, _ := (&Account{Password: password}).AsAccount()
++	return &protocol.MemoryUser{Email: email, Account: account}
++}
++
++func TestRemoveUserInterruptsOnlyItsActiveTrojanSessions(t *testing.T) {
++	userA := testTrojanMemoryUser("A@example.com", "password-a")
++	userB := testTrojanMemoryUser("b@example.com", "password-b")
++	server := &Server{validator: new(Validator)}
++	if err := server.validator.Add(userA); err != nil {
++		t.Fatal(err)
++	}
++	if err := server.validator.Add(userB); err != nil {
++		t.Fatal(err)
++	}
++
++	serverA, clientA := stdnet.Pipe()
++	defer clientA.Close()
++	unregisterA, err := server.activeSessions.Register(userA.Email, serverA, func(email string) bool {
++		current := server.validator.GetByEmail(email)
++		return current != nil && current.Account.Equals(userA.Account)
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer unregisterA()
++
++	serverB, clientB := stdnet.Pipe()
++	defer serverB.Close()
++	defer clientB.Close()
++	go func() { _, _ = io.Copy(io.Discard, serverB) }()
++	unregisterB, err := server.activeSessions.Register(userB.Email, serverB, func(email string) bool {
++		current := server.validator.GetByEmail(email)
++		return current != nil && current.Account.Equals(userB.Account)
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer unregisterB()
++
++	if err := server.RemoveUser(context.Background(), "a@EXAMPLE.com"); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := clientA.Write([]byte("closed")); err == nil {
++		t.Fatal("removed Trojan user's peer remained writable")
++	}
++	if err := server.RemoveUser(context.Background(), "a@example.com"); err != nil {
++		t.Fatalf("repeated removal must remain idempotent: %v", err)
++	}
++	if _, err := clientB.Write([]byte("still-open")); err != nil {
++		t.Fatalf("another Trojan user's session was interrupted: %v", err)
++	}
++}
++
++func TestTrojanAuthenticationRaceCannotRegisterRemovedIdentity(t *testing.T) {
++	oldUser := testTrojanMemoryUser("same@example.com", "old-password")
++	newUser := testTrojanMemoryUser("same@example.com", "new-password")
++	server := &Server{validator: new(Validator)}
++	if err := server.validator.Add(oldUser); err != nil {
++		t.Fatal(err)
++	}
++	if err := server.RemoveUser(context.Background(), oldUser.Email); err != nil {
++		t.Fatal(err)
++	}
++	if err := server.AddUser(context.Background(), newUser); err != nil {
++		t.Fatal(err)
++	}
++
++	oldServer, oldClient := stdnet.Pipe()
++	defer oldServer.Close()
++	defer oldClient.Close()
++	if _, err := server.activeSessions.Register(oldUser.Email, oldServer, func(email string) bool {
++		current := server.validator.GetByEmail(email)
++		return current != nil && current.Account.Equals(oldUser.Account)
++	}); err == nil {
++		t.Fatal("a connection authenticated with the removed password joined the replacement user's registry")
++	}
++}
++
++func TestTrojanServerCloseInterruptsSessionsAndRejectsLateRegistration(t *testing.T) {
++	user := testTrojanMemoryUser("close@example.com", "close-password")
++	server := &Server{validator: new(Validator)}
++	if err := server.validator.Add(user); err != nil {
++		t.Fatal(err)
++	}
++	serverConn, clientConn := stdnet.Pipe()
++	defer clientConn.Close()
++	unregister, err := server.activeSessions.Register(user.Email, serverConn, func(string) bool { return true })
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer unregister()
++	if err := server.Close(); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := clientConn.Write([]byte("closed")); err == nil {
++		t.Fatal("server close left an active Trojan session writable")
++	}
++	if err := server.AddUser(context.Background(), testTrojanMemoryUser("late@example.com", "late")); err == nil {
++		t.Fatal("closed Trojan server admitted a late user")
++	}
++}
+diff --git a/proxy/trojan/server.go b/proxy/trojan/server.go
+index d5979e52..ef8cca9d 100644
+--- a/proxy/trojan/server.go
++++ b/proxy/trojan/server.go
+@@ -35,10 +35,11 @@ func init() {
+ 
+ // Server is an inbound connection handler that handles messages in trojan protocol.
+ type Server struct {
+-	policyManager policy.Manager
+-	validator     *Validator
+-	fallbacks     map[string]map[string]map[string]*Fallback // or nil
+-	cone          bool
++	policyManager  policy.Manager
++	validator      *Validator
++	fallbacks      map[string]map[string]map[string]*Fallback // or nil
++	cone           bool
++	activeSessions common.ActiveUserSessions
+ }
+ 
+ // NewServer creates a new trojan inbound handler.
+@@ -117,12 +118,33 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
+ 
+ // AddUser implements proxy.UserManager.AddUser().
+ func (s *Server) AddUser(ctx context.Context, u *protocol.MemoryUser) error {
+-	return s.validator.Add(u)
++	return s.activeSessions.MutateIfOpen(func() error {
++		return s.validator.Add(u)
++	})
+ }
+ 
+ // RemoveUser implements proxy.UserManager.RemoveUser().
+ func (s *Server) RemoveUser(ctx context.Context, e string) error {
+-	return s.validator.Del(e)
++	sessions, err := s.activeSessions.Revoke(e, func(email string) error {
++		if s.validator.GetByEmail(email) == nil {
++			return nil
++		}
++		return s.validator.Del(email)
++	})
++	for _, connection := range sessions {
++		if closeErr := common.Interrupt(connection); closeErr != nil && err == nil {
++			err = errors.New("failed to interrupt active Trojan user session").Base(closeErr)
++		}
++	}
++	return err
++}
++
++// Close interrupts authenticated Trojan sessions and prevents late admission.
++func (s *Server) Close() error {
++	for _, connection := range s.activeSessions.Close() {
++		_ = common.Interrupt(connection)
++	}
++	return nil
+ }
+ 
+ // GetUser implements proxy.UserManager.GetUser().
+@@ -206,6 +228,15 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
+ 		return errors.New("invalid protocol or invalid user")
+ 	}
+ 
++	unregisterSession, err := s.activeSessions.Register(user.Email, conn, func(email string) bool {
++		current := s.validator.GetByEmail(email)
++		return current != nil && current.Account != nil && current.Account.Equals(user.Account)
++	})
++	if err != nil {
++		return errors.New("Trojan user was removed while the connection was authenticating").Base(err).AtInfo()
++	}
++	defer unregisterSession()
++
+ 	clientReader := &ConnReader{Reader: bufferedReader}
+ 	if err := clientReader.ParseHeader(); err != nil {
+ 		log.Record(&log.AccessMessage{
+diff --git a/proxy/vless/inbound/inbound.go b/proxy/vless/inbound/inbound.go
+index 010e755f..8f0690f3 100644
+--- a/proxy/vless/inbound/inbound.go
++++ b/proxy/vless/inbound/inbound.go
+@@ -9,7 +9,6 @@ import (
+ 	"reflect"
+ 	"strconv"
+ 	"strings"
+-	"sync"
+ 	"time"
+ 	"unsafe"
+ 
+@@ -85,10 +84,7 @@ type Handler struct {
+ 	defaultDispatcher      routing.Dispatcher
+ 	ctx                    context.Context
+ 	fallbacks              map[string]map[string]map[string]*Fallback // or nil
+-	activeSessionsMu       sync.Mutex
+-	activeSessions         map[string]map[uint64]common.Closable
+-	nextActiveSessionID    uint64
+-	activeSessionsClosed   bool
++	activeSessions         common.ActiveUserSessions
+ 	// regexps               map[string]*regexp.Regexp       // or nil
+ }
+ 
+@@ -232,7 +228,7 @@ func (h *Handler) RemoveReverse(u *protocol.MemoryUser) {
+ 
+ // Close implements common.Closable.Close().
+ func (h *Handler) Close() error {
+-	sessions := h.takeAllActiveSessions()
++	sessions := h.activeSessions.Close()
+ 	for _, connection := range sessions {
+ 		_ = common.Interrupt(connection)
+ 	}
+@@ -247,25 +243,21 @@ func (h *Handler) Close() error {
+ 
+ // AddUser implements proxy.UserManager.AddUser().
+ func (h *Handler) AddUser(ctx context.Context, u *protocol.MemoryUser) error {
+-	h.activeSessionsMu.Lock()
+-	defer h.activeSessionsMu.Unlock()
+-	if h.activeSessionsClosed {
+-		return errors.New("VLESS inbound is closed").AtInfo()
+-	}
+-	return h.validator.Add(u)
++	return h.activeSessions.MutateIfOpen(func() error {
++		return h.validator.Add(u)
++	})
+ }
+ 
+ // RemoveUser implements proxy.UserManager.RemoveUser().
+ func (h *Handler) RemoveUser(ctx context.Context, e string) error {
+-	email := strings.ToLower(strings.TrimSpace(e))
+-	h.activeSessionsMu.Lock()
+-	user := h.validator.GetByEmail(email)
+-	var err error
+-	if user != nil {
+-		err = h.validator.Del(email)
+-	}
+-	sessions := h.activeSessionsForEmailLocked(email)
+-	h.activeSessionsMu.Unlock()
++	var user *protocol.MemoryUser
++	sessions, err := h.activeSessions.Revoke(e, func(email string) error {
++		user = h.validator.GetByEmail(email)
++		if user != nil {
++			return h.validator.Del(email)
++		}
++		return nil
++	})
+ 
+ 	h.RemoveReverse(user)
+ 	for _, connection := range sessions {
+@@ -280,68 +272,10 @@ func (h *Handler) registerActiveSession(user *protocol.MemoryUser, connection co
+ 	if user == nil || user.Account == nil || connection == nil {
+ 		return func() {}, nil
+ 	}
+-	email := strings.ToLower(strings.TrimSpace(user.Email))
+-	if email == "" {
+-		return func() {}, nil
+-	}
+-
+-	h.activeSessionsMu.Lock()
+-	if h.activeSessionsClosed {
+-		h.activeSessionsMu.Unlock()
+-		return nil, errors.New("VLESS inbound is closed").AtInfo()
+-	}
+-	current := h.validator.GetByEmail(email)
+-	if current == nil || current.Account == nil || !current.Account.Equals(user.Account) {
+-		h.activeSessionsMu.Unlock()
+-		return nil, errors.New("VLESS user was removed while the connection was authenticating").AtInfo()
+-	}
+-	if h.activeSessions == nil {
+-		h.activeSessions = make(map[string]map[uint64]common.Closable)
+-	}
+-	byID := h.activeSessions[email]
+-	if byID == nil {
+-		byID = make(map[uint64]common.Closable)
+-		h.activeSessions[email] = byID
+-	}
+-	h.nextActiveSessionID++
+-	sessionID := h.nextActiveSessionID
+-	byID[sessionID] = connection
+-	h.activeSessionsMu.Unlock()
+-
+-	return func() {
+-		h.activeSessionsMu.Lock()
+-		if currentByID := h.activeSessions[email]; currentByID != nil {
+-			delete(currentByID, sessionID)
+-			if len(currentByID) == 0 {
+-				delete(h.activeSessions, email)
+-			}
+-		}
+-		h.activeSessionsMu.Unlock()
+-	}, nil
+-}
+-
+-func (h *Handler) activeSessionsForEmailLocked(email string) []common.Closable {
+-	byID := h.activeSessions[email]
+-	if len(byID) == 0 {
+-		return nil
+-	}
+-	sessions := make([]common.Closable, 0, len(byID))
+-	for _, connection := range byID {
+-		sessions = append(sessions, connection)
+-	}
+-	return sessions
+-}
+-
+-func (h *Handler) takeAllActiveSessions() []common.Closable {
+-	h.activeSessionsMu.Lock()
+-	defer h.activeSessionsMu.Unlock()
+-	var sessions []common.Closable
+-	for email := range h.activeSessions {
+-		sessions = append(sessions, h.activeSessionsForEmailLocked(email)...)
+-	}
+-	h.activeSessions = nil
+-	h.activeSessionsClosed = true
+-	return sessions
++	return h.activeSessions.Register(user.Email, connection, func(email string) bool {
++		current := h.validator.GetByEmail(email)
++		return current != nil && current.Account != nil && current.Account.Equals(user.Account)
++	})
+ }
+ 
+ // GetUser implements proxy.UserManager.GetUser().
+diff --git a/testing/scenarios/trojan_active_revoke_test.go b/testing/scenarios/trojan_active_revoke_test.go
+new file mode 100644
+index 00000000..2550c6b7
+--- /dev/null
++++ b/testing/scenarios/trojan_active_revoke_test.go
+@@ -0,0 +1,195 @@
++package scenarios
++
++import (
++	"context"
++	"fmt"
++	"testing"
++	"time"
++
++	"github.com/xtls/xray-core/app/commander"
++	"github.com/xtls/xray-core/app/policy"
++	"github.com/xtls/xray-core/app/proxyman"
++	"github.com/xtls/xray-core/app/proxyman/command"
++	"github.com/xtls/xray-core/app/router"
++	"github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/common/protocol"
++	"github.com/xtls/xray-core/common/serial"
++	core "github.com/xtls/xray-core/core"
++	"github.com/xtls/xray-core/proxy/dokodemo"
++	"github.com/xtls/xray-core/proxy/freedom"
++	"github.com/xtls/xray-core/proxy/trojan"
++	"github.com/xtls/xray-core/testing/servers/tcp"
++	"google.golang.org/grpc"
++	"google.golang.org/grpc/credentials/insecure"
++)
++
++func TestCommanderRemoveTrojanUserInterruptsExactActiveConnection(t *testing.T) {
++	backend := tcp.Server{MsgProcessor: xor}
++	destination, err := backend.Start()
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer backend.Close()
++
++	const (
++		userAEmail    = "trojan-a@example.com"
++		userAPassword = "trojan-active-revoke-a"
++		userBEmail    = "trojan-b@example.com"
++		userBPassword = "trojan-active-revoke-b"
++	)
++	serverPort := tcp.PickPort()
++	commandPort := tcp.PickPort()
++	clientAPort := tcp.PickPort()
++	clientBPort := tcp.PickPort()
++
++	serverConfig := &core.Config{
++		App: []*serial.TypedMessage{
++			serial.ToTypedMessage(&commander.Config{
++				Tag: "api",
++				Service: []*serial.TypedMessage{
++					serial.ToTypedMessage(&command.Config{}),
++				},
++			}),
++			serial.ToTypedMessage(&router.Config{
++				Rule: []*router.RoutingRule{{
++					InboundTag: []string{"api"},
++					TargetTag:  &router.RoutingRule_Tag{Tag: "api"},
++				}},
++			}),
++			serial.ToTypedMessage(&policy.Config{
++				Level: map[uint32]*policy.Policy{
++					0: {Timeout: &policy.Policy_Timeout{
++						UplinkOnly:   &policy.Second{Value: 0},
++						DownlinkOnly: &policy.Second{Value: 0},
++					}},
++				},
++			}),
++		},
++		Inbound: []*core.InboundHandlerConfig{
++			{
++				Tag: "trojan",
++				ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
++					PortList: &net.PortList{Range: []*net.PortRange{net.SinglePortRange(serverPort)}},
++					Listen:   net.NewIPOrDomain(net.LocalHostIP),
++				}),
++				ProxySettings: serial.ToTypedMessage(&trojan.ServerConfig{Users: []*protocol.User{
++					{Email: userAEmail, Account: serial.ToTypedMessage(&trojan.Account{Password: userAPassword})},
++					{Email: userBEmail, Account: serial.ToTypedMessage(&trojan.Account{Password: userBPassword})},
++				}}),
++			},
++			{
++				Tag: "api",
++				ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
++					PortList: &net.PortList{Range: []*net.PortRange{net.SinglePortRange(commandPort)}},
++					Listen:   net.NewIPOrDomain(net.LocalHostIP),
++				}),
++				ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
++					RewriteAddress:  net.NewIPOrDomain(destination.Address),
++					RewritePort:     uint32(destination.Port),
++					AllowedNetworks: []net.Network{net.Network_TCP},
++				}),
++			},
++		},
++		Outbound: []*core.OutboundHandlerConfig{{
++			ProxySettings: serial.ToTypedMessage(&freedom.Config{
++				FinalRules: []*freedom.FinalRuleConfig{{Action: freedom.RuleAction_Allow}},
++			}),
++		}},
++	}
++
++	clientConfig := func(port net.Port, password string) *core.Config {
++		return &core.Config{
++			Inbound: []*core.InboundHandlerConfig{{
++				ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
++					PortList: &net.PortList{Range: []*net.PortRange{net.SinglePortRange(port)}},
++					Listen:   net.NewIPOrDomain(net.LocalHostIP),
++				}),
++				ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
++					RewriteAddress:  net.NewIPOrDomain(destination.Address),
++					RewritePort:     uint32(destination.Port),
++					AllowedNetworks: []net.Network{net.Network_TCP},
++				}),
++			}},
++			Outbound: []*core.OutboundHandlerConfig{{
++				ProxySettings: serial.ToTypedMessage(&trojan.ClientConfig{
++					Server: &protocol.ServerEndpoint{
++						Address: net.NewIPOrDomain(net.LocalHostIP),
++						Port:    uint32(serverPort),
++						User: &protocol.User{
++							Account: serial.ToTypedMessage(&trojan.Account{Password: password}),
++						},
++					},
++				}),
++			}},
++		}
++	}
++
++	servers, err := InitializeServerConfigs(
++		serverConfig,
++		clientConfig(clientAPort, userAPassword),
++		clientConfig(clientBPort, userBPassword),
++	)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer CloseAllServers(servers)
++
++	connect := func(port net.Port) (net.Conn, error) {
++		return net.DialTCP("tcp", nil, &net.TCPAddr{
++			IP:   []byte{127, 0, 0, 1},
++			Port: int(port),
++		})
++	}
++	connectionA, err := connect(clientAPort)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer connectionA.Close()
++	connectionB, err := connect(clientBPort)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer connectionB.Close()
++	if err := testTCPConn2(connectionA, 4096, 3*time.Second)(); err != nil {
++		t.Fatalf("user A did not establish a long-lived Trojan stream: %v", err)
++	}
++	if err := testTCPConn2(connectionB, 4096, 3*time.Second)(); err != nil {
++		t.Fatalf("user B did not establish a long-lived Trojan stream: %v", err)
++	}
++
++	commandConn, err := grpc.Dial(
++		fmt.Sprintf("127.0.0.1:%d", commandPort),
++		grpc.WithTransportCredentials(insecure.NewCredentials()),
++		grpc.WithBlock(),
++	)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer commandConn.Close()
++	handlerClient := command.NewHandlerServiceClient(commandConn)
++	response, err := handlerClient.AlterInbound(context.Background(), &command.AlterInboundRequest{
++		Tag: "trojan",
++		Operation: serial.ToTypedMessage(&command.RemoveUserOperation{
++			Email: userAEmail,
++		}),
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if response == nil {
++		t.Fatal("nil Trojan RemoveUser response")
++	}
++
++	if err := testTCPConn2(connectionA, 1024, 3*time.Second)(); err == nil {
++		t.Fatal("removed user's already-authenticated Trojan stream remained usable")
++	}
++	if err := testTCPConn2(connectionB, 4096, 3*time.Second)(); err != nil {
++		t.Fatalf("another user's Trojan stream was interrupted: %v", err)
++	}
++	if err := testTCPConn(clientAPort, 1024, 3*time.Second)(); err == nil {
++		t.Fatal("removed Trojan password established a new stream")
++	}
++	if err := testTCPConn(clientBPort, 4096, 3*time.Second)(); err != nil {
++		t.Fatalf("another Trojan user could not establish a new stream: %v", err)
++	}
++}

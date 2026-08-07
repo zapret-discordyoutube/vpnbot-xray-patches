@@ -1,0 +1,806 @@
+From 0d9b32c4884df93996aa708be40787c186b8b41b Mon Sep 17 00:00:00 2001
+From: loop-uh <loop-uh@users.noreply.github.com>
+Date: Thu, 6 Aug 2026 01:49:25 +0300
+Subject: [PATCH 3/3] Interrupt all managed Xray user sessions
+
+---
+ VPNBOT_ACTIVE_REVOKE.md                       |  31 +-
+ core/core.go                                  |   1 +
+ proxy/shadowsocks/active_sessions_test.go     |  71 ++++
+ proxy/shadowsocks/server.go                   |  58 ++-
+ proxy/vmess/inbound/active_sessions_test.go   |  80 ++++
+ proxy/vmess/inbound/inbound.go                |  58 ++-
+ .../managed_user_active_revoke_test.go        | 350 ++++++++++++++++++
+ 7 files changed, 617 insertions(+), 32 deletions(-)
+ create mode 100644 proxy/shadowsocks/active_sessions_test.go
+ create mode 100644 proxy/vmess/inbound/active_sessions_test.go
+ create mode 100644 testing/scenarios/managed_user_active_revoke_test.go
+
+diff --git a/VPNBOT_ACTIVE_REVOKE.md b/VPNBOT_ACTIVE_REVOKE.md
+index d6b4c594..2e760f3d 100644
+--- a/VPNBOT_ACTIVE_REVOKE.md
++++ b/VPNBOT_ACTIVE_REVOKE.md
+@@ -1,23 +1,24 @@
+-# VPnBot exact active VLESS and Trojan revocation
++# VPnBot exact active user revocation
+ 
+ This fork carries one deliberately narrow behavior change for VPnBot-managed
+-VLESS and Trojan users: a successful `HandlerService.RemoveUser` operation both
+-removes the credential from the in-memory validator and interrupts the active
+-transport connections authenticated as that exact inbound email.
++VLESS, Trojan, VMess and Shadowsocks users: a successful
++`HandlerService.RemoveUser` operation both removes the credential from the
++in-memory validator and interrupts the active transport connections
++authenticated as that exact inbound email.
+ 
+ The capability is reported by `xray version` as:
+ 
+ ```text
+-VPnBot capability: vpnbot-active-revoke-v2
++VPnBot capability: vpnbot-active-revoke-v3
+ ```
+ 
+-The version statement also retains the earlier
+-`vpnbot-active-revoke-v1` marker as a backward-compatibility claim for VLESS.
+-VPnBot node installers and updaters that require Trojan revocation must fail
+-closed when the `v2` marker is absent.
++The version statement also retains `vpnbot-active-revoke-v1` for VLESS and
++`vpnbot-active-revoke-v2` for VLESS plus Trojan. VPnBot node installers and
++updaters that require all managed Xray protocols must fail closed when the
++`v3` marker is absent.
+ 
+ The implementation uses one shared active-session registry primitive inside
+-each VLESS and Trojan inbound handler. Registry admission and
++each VLESS, Trojan, VMess and Shadowsocks inbound handler. Registry admission and
+ `AddUser`/`RemoveUser` mutations share one mutex, so a connection authenticated
+ before deletion cannot register after the same email has been deleted or
+ replaced. `RemoveUser` deletes the validator entry before closing its captured
+@@ -31,8 +32,8 @@ user's active connection.
+ 
+ Regression coverage lives in
+ `common/active_user_sessions_test.go`,
+-`proxy/vless/inbound/active_sessions_test.go`, and
+-`proxy/trojan/active_sessions_test.go`. Before a VPnBot release, the fork must
+-also pass the upstream protocol scenarios and an external long-stream E2E for
+-every transport used by production: VLESS TCP, WebSocket, gRPC and XHTTP, plus
+-Trojan TCP.
++`proxy/vless/inbound/active_sessions_test.go`, and the corresponding VLESS,
++Trojan, VMess and Shadowsocks tests. Before a VPnBot release, the fork must also
++pass the upstream protocol scenarios and an external long-stream E2E for every
++transport used by production: VLESS TCP, WebSocket, gRPC and XHTTP, plus Trojan
++TCP, VMess TCP and Shadowsocks TCP/UDP.
+diff --git a/core/core.go b/core/core.go
+index e0b0c14c..c58a0752 100644
+--- a/core/core.go
++++ b/core/core.go
+@@ -70,5 +70,6 @@ func VersionStatement() []string {
+ 		intro,
+ 		"VPnBot capability: vpnbot-active-revoke-v1",
+ 		"VPnBot capability: vpnbot-active-revoke-v2",
++		"VPnBot capability: vpnbot-active-revoke-v3",
+ 	}
+ }
+diff --git a/proxy/shadowsocks/active_sessions_test.go b/proxy/shadowsocks/active_sessions_test.go
+new file mode 100644
+index 00000000..e0ceb490
+--- /dev/null
++++ b/proxy/shadowsocks/active_sessions_test.go
+@@ -0,0 +1,71 @@
++package shadowsocks
++
++import (
++	"context"
++	"io"
++	stdnet "net"
++	"testing"
++
++	"github.com/xtls/xray-core/common/protocol"
++)
++
++func testShadowsocksMemoryUser(t *testing.T, email, password string) *protocol.MemoryUser {
++	t.Helper()
++	account, err := (&Account{
++		Password:   password,
++		CipherType: CipherType_CHACHA20_POLY1305,
++	}).AsAccount()
++	if err != nil {
++		t.Fatal(err)
++	}
++	return &protocol.MemoryUser{Email: email, Account: account}
++}
++
++func TestRemoveUserInterruptsOnlyItsActiveShadowsocksSessions(t *testing.T) {
++	userA := testShadowsocksMemoryUser(t, "A@example.com", "password-a")
++	userB := testShadowsocksMemoryUser(t, "b@example.com", "password-b")
++	server := &Server{validator: new(Validator)}
++	if err := server.AddUser(context.Background(), userA); err != nil {
++		t.Fatal(err)
++	}
++	if err := server.AddUser(context.Background(), userB); err != nil {
++		t.Fatal(err)
++	}
++
++	serverA, clientA := stdnet.Pipe()
++	defer clientA.Close()
++	unregisterA, err := server.activeSessions.Register(userA.Email, serverA, func(email string) bool {
++		current := server.validator.GetByEmail(email)
++		return current != nil && current.Account.Equals(userA.Account)
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer unregisterA()
++
++	serverB, clientB := stdnet.Pipe()
++	defer serverB.Close()
++	defer clientB.Close()
++	go func() { _, _ = io.Copy(io.Discard, serverB) }()
++	unregisterB, err := server.activeSessions.Register(userB.Email, serverB, func(email string) bool {
++		current := server.validator.GetByEmail(email)
++		return current != nil && current.Account.Equals(userB.Account)
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer unregisterB()
++
++	if err := server.RemoveUser(context.Background(), "a@EXAMPLE.com"); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := clientA.Write([]byte("closed")); err == nil {
++		t.Fatal("removed Shadowsocks user's peer remained writable")
++	}
++	if err := server.RemoveUser(context.Background(), "a@example.com"); err != nil {
++		t.Fatalf("repeated removal must remain idempotent: %v", err)
++	}
++	if _, err := clientB.Write([]byte("still-open")); err != nil {
++		t.Fatalf("another Shadowsocks user's session was interrupted: %v", err)
++	}
++}
+diff --git a/proxy/shadowsocks/server.go b/proxy/shadowsocks/server.go
+index 360ea38c..83a52efa 100644
+--- a/proxy/shadowsocks/server.go
++++ b/proxy/shadowsocks/server.go
+@@ -22,10 +22,11 @@ import (
+ )
+ 
+ type Server struct {
+-	config        *ServerConfig
+-	validator     *Validator
+-	policyManager policy.Manager
+-	cone          bool
++	config         *ServerConfig
++	validator      *Validator
++	policyManager  policy.Manager
++	cone           bool
++	activeSessions common.ActiveUserSessions
+ }
+ 
+ // NewServer create a new Shadowsocks server.
+@@ -55,12 +56,33 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
+ 
+ // AddUser implements proxy.UserManager.AddUser().
+ func (s *Server) AddUser(ctx context.Context, u *protocol.MemoryUser) error {
+-	return s.validator.Add(u)
++	return s.activeSessions.MutateIfOpen(func() error {
++		return s.validator.Add(u)
++	})
+ }
+ 
+ // RemoveUser implements proxy.UserManager.RemoveUser().
+ func (s *Server) RemoveUser(ctx context.Context, e string) error {
+-	return s.validator.Del(e)
++	sessions, err := s.activeSessions.Revoke(e, func(email string) error {
++		if s.validator.GetByEmail(email) == nil {
++			return nil
++		}
++		return s.validator.Del(email)
++	})
++	for _, connection := range sessions {
++		if closeErr := common.Interrupt(connection); closeErr != nil && err == nil {
++			err = errors.New("failed to interrupt active Shadowsocks user session").Base(closeErr)
++		}
++	}
++	return err
++}
++
++// Close interrupts authenticated Shadowsocks sessions and prevents late admission.
++func (s *Server) Close() error {
++	for _, connection := range s.activeSessions.Close() {
++		_ = common.Interrupt(connection)
++	}
++	return nil
+ }
+ 
+ // GetUser implements proxy.UserManager.GetUser().
+@@ -102,6 +124,12 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
+ }
+ 
+ func (s *Server) handleUDPPayload(ctx context.Context, conn stat.Connection, dispatcher routing.Dispatcher) error {
++	var unregisterSession func()
++	defer func() {
++		if unregisterSession != nil {
++			unregisterSession()
++		}
++	}()
+ 	udpServer := udp.NewDispatcher(dispatcher, func(ctx context.Context, packet *udp_proto.Packet) {
+ 		request := protocol.RequestHeaderFromContext(ctx)
+ 		payload := packet.Payload
+@@ -168,6 +196,16 @@ func (s *Server) handleUDPPayload(ctx context.Context, conn stat.Connection, dis
+ 				payload.Release()
+ 				continue
+ 			}
++			if unregisterSession == nil {
++				unregisterSession, err = s.activeSessions.Register(request.User.Email, conn, func(email string) bool {
++					current := s.validator.GetByEmail(email)
++					return current != nil && current.Account != nil && current.Account.Equals(request.User.Account)
++				})
++				if err != nil {
++					data.Release()
++					return errors.New("Shadowsocks user was removed while the UDP session was authenticating").Base(err).AtInfo()
++				}
++			}
+ 
+ 			destination := request.Destination()
+ 
+@@ -214,6 +252,14 @@ func (s *Server) handleConnection(ctx context.Context, conn stat.Connection, dis
+ 		})
+ 		return errors.New("failed to create request from: ", conn.RemoteAddr()).Base(err)
+ 	}
++	unregisterSession, err := s.activeSessions.Register(request.User.Email, conn, func(email string) bool {
++		current := s.validator.GetByEmail(email)
++		return current != nil && current.Account != nil && current.Account.Equals(request.User.Account)
++	})
++	if err != nil {
++		return errors.New("Shadowsocks user was removed while the connection was authenticating").Base(err).AtInfo()
++	}
++	defer unregisterSession()
+ 	conn.SetReadDeadline(time.Time{})
+ 
+ 	inbound := session.InboundFromContext(ctx)
+diff --git a/proxy/vmess/inbound/active_sessions_test.go b/proxy/vmess/inbound/active_sessions_test.go
+new file mode 100644
+index 00000000..3a927ce8
+--- /dev/null
++++ b/proxy/vmess/inbound/active_sessions_test.go
+@@ -0,0 +1,80 @@
++package inbound
++
++import (
++	"context"
++	"io"
++	stdnet "net"
++	"testing"
++
++	"github.com/xtls/xray-core/common/protocol"
++	"github.com/xtls/xray-core/common/uuid"
++	"github.com/xtls/xray-core/proxy/vmess"
++	"github.com/xtls/xray-core/proxy/vmess/encoding"
++)
++
++func testVMessMemoryUser(t *testing.T, email, rawID string) *protocol.MemoryUser {
++	t.Helper()
++	account, err := (&vmess.Account{Id: rawID}).AsAccount()
++	if err != nil {
++		t.Fatal(err)
++	}
++	return &protocol.MemoryUser{Email: email, Account: account}
++}
++
++func testVMessHandler() *Handler {
++	return &Handler{
++		clients:        vmess.NewTimedUserValidator(),
++		usersByEmail:   newUserByEmail(&DefaultConfig{}),
++		sessionHistory: encoding.NewSessionHistory(),
++	}
++}
++
++func TestRemoveUserInterruptsOnlyItsActiveVMessSessions(t *testing.T) {
++	userA := testVMessMemoryUser(t, "A@example.com", protocol.NewID(uuid.New()).String())
++	userB := testVMessMemoryUser(t, "b@example.com", protocol.NewID(uuid.New()).String())
++	handler := testVMessHandler()
++	defer handler.sessionHistory.Close()
++	if err := handler.AddUser(context.Background(), userA); err != nil {
++		t.Fatal(err)
++	}
++	if err := handler.AddUser(context.Background(), userB); err != nil {
++		t.Fatal(err)
++	}
++
++	serverA, clientA := stdnet.Pipe()
++	defer clientA.Close()
++	unregisterA, err := handler.activeSessions.Register(userA.Email, serverA, func(email string) bool {
++		current := handler.usersByEmail.Get(email)
++		return current != nil && current.Account.Equals(userA.Account)
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer unregisterA()
++
++	serverB, clientB := stdnet.Pipe()
++	defer serverB.Close()
++	defer clientB.Close()
++	go func() { _, _ = io.Copy(io.Discard, serverB) }()
++	unregisterB, err := handler.activeSessions.Register(userB.Email, serverB, func(email string) bool {
++		current := handler.usersByEmail.Get(email)
++		return current != nil && current.Account.Equals(userB.Account)
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer unregisterB()
++
++	if err := handler.RemoveUser(context.Background(), "a@EXAMPLE.com"); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := clientA.Write([]byte("closed")); err == nil {
++		t.Fatal("removed VMess user's peer remained writable")
++	}
++	if err := handler.RemoveUser(context.Background(), "a@example.com"); err != nil {
++		t.Fatalf("repeated removal must remain idempotent: %v", err)
++	}
++	if _, err := clientB.Write([]byte("still-open")); err != nil {
++		t.Fatalf("another VMess user's session was interrupted: %v", err)
++	}
++}
+diff --git a/proxy/vmess/inbound/inbound.go b/proxy/vmess/inbound/inbound.go
+index e084a881..89cc2a51 100644
+--- a/proxy/vmess/inbound/inbound.go
++++ b/proxy/vmess/inbound/inbound.go
+@@ -107,6 +107,7 @@ type Handler struct {
+ 	clients               *vmess.TimedUserValidator
+ 	usersByEmail          *userByEmail
+ 	sessionHistory        *encoding.SessionHistory
++	activeSessions        common.ActiveUserSessions
+ }
+ 
+ // New creates a new VMess inbound handler.
+@@ -136,6 +137,9 @@ func New(ctx context.Context, config *Config) (*Handler, error) {
+ 
+ // Close implements common.Closable.
+ func (h *Handler) Close() error {
++	for _, connection := range h.activeSessions.Close() {
++		_ = common.Interrupt(connection)
++	}
+ 	return errors.Combine(
+ 		h.sessionHistory.Close(),
+ 		common.Close(h.usersByEmail),
+@@ -148,9 +152,17 @@ func (*Handler) Network() []net.Network {
+ }
+ 
+ func (h *Handler) GetOrGenerateUser(email string) *protocol.MemoryUser {
+-	user, existing := h.usersByEmail.GetOrGenerate(email)
+-	if !existing {
+-		h.clients.Add(user)
++	var user *protocol.MemoryUser
++	err := h.activeSessions.MutateIfOpen(func() error {
++		var existing bool
++		user, existing = h.usersByEmail.GetOrGenerate(email)
++		if !existing {
++			return h.clients.Add(user)
++		}
++		return nil
++	})
++	if err != nil {
++		return nil
+ 	}
+ 	return user
+ }
+@@ -168,21 +180,36 @@ func (h *Handler) GetUsersCount(context.Context) int64 {
+ }
+ 
+ func (h *Handler) AddUser(ctx context.Context, user *protocol.MemoryUser) error {
+-	if len(user.Email) > 0 && !h.usersByEmail.Add(user) {
+-		return errors.New("User ", user.Email, " already exists.")
+-	}
+-	return h.clients.Add(user)
++	return h.activeSessions.MutateIfOpen(func() error {
++		if len(user.Email) > 0 && !h.usersByEmail.Add(user) {
++			return errors.New("User ", user.Email, " already exists.")
++		}
++		return h.clients.Add(user)
++	})
+ }
+ 
+ func (h *Handler) RemoveUser(ctx context.Context, email string) error {
+ 	if email == "" {
+ 		return errors.New("Email must not be empty.")
+ 	}
+-	if !h.usersByEmail.Remove(email) {
+-		return errors.New("User ", email, " not found.")
++	sessions, err := h.activeSessions.Revoke(email, func(normalizedEmail string) error {
++		if h.usersByEmail.Get(normalizedEmail) == nil {
++			return nil
++		}
++		if !h.usersByEmail.Remove(normalizedEmail) {
++			return errors.New("VMess email index changed during removal")
++		}
++		if !h.clients.Remove(normalizedEmail) {
++			return errors.New("VMess validator changed during removal")
++		}
++		return nil
++	})
++	for _, connection := range sessions {
++		if closeErr := common.Interrupt(connection); closeErr != nil && err == nil {
++			err = errors.New("failed to interrupt active VMess user session").Base(closeErr)
++		}
+ 	}
+-	h.clients.Remove(email)
+-	return nil
++	return err
+ }
+ 
+ func transferResponse(timer signal.ActivityUpdater, session *encoding.ServerSession, request *protocol.RequestHeader, response *protocol.ResponseHeader, input buf.Reader, output *buf.BufferedWriter) error {
+@@ -252,6 +279,15 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
+ 		return err
+ 	}
+ 
++	unregisterSession, err := h.activeSessions.Register(request.User.Email, connection, func(email string) bool {
++		current := h.usersByEmail.Get(email)
++		return current != nil && current.Account != nil && current.Account.Equals(request.User.Account)
++	})
++	if err != nil {
++		return errors.New("VMess user was removed while the connection was authenticating").Base(err).AtInfo()
++	}
++	defer unregisterSession()
++
+ 	if request.Command != protocol.RequestCommandMux {
+ 		ctx = log.ContextWithAccessMessage(ctx, &log.AccessMessage{
+ 			From:   connection.RemoteAddr(),
+diff --git a/testing/scenarios/managed_user_active_revoke_test.go b/testing/scenarios/managed_user_active_revoke_test.go
+new file mode 100644
+index 00000000..735549e1
+--- /dev/null
++++ b/testing/scenarios/managed_user_active_revoke_test.go
+@@ -0,0 +1,350 @@
++package scenarios
++
++import (
++	"context"
++	"fmt"
++	"testing"
++	"time"
++
++	"github.com/xtls/xray-core/app/commander"
++	"github.com/xtls/xray-core/app/policy"
++	"github.com/xtls/xray-core/app/proxyman"
++	"github.com/xtls/xray-core/app/proxyman/command"
++	"github.com/xtls/xray-core/app/router"
++	"github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/common/protocol"
++	"github.com/xtls/xray-core/common/serial"
++	"github.com/xtls/xray-core/common/uuid"
++	core "github.com/xtls/xray-core/core"
++	"github.com/xtls/xray-core/proxy/dokodemo"
++	"github.com/xtls/xray-core/proxy/freedom"
++	"github.com/xtls/xray-core/proxy/shadowsocks"
++	"github.com/xtls/xray-core/proxy/vmess"
++	vmessinbound "github.com/xtls/xray-core/proxy/vmess/inbound"
++	vmessoutbound "github.com/xtls/xray-core/proxy/vmess/outbound"
++	"github.com/xtls/xray-core/testing/servers/tcp"
++	"github.com/xtls/xray-core/testing/servers/udp"
++	"google.golang.org/grpc"
++	"google.golang.org/grpc/credentials/insecure"
++)
++
++func runManagedUserActiveRevokeScenario(
++	t *testing.T,
++	inboundTag string,
++	email string,
++	serverProxy *serial.TypedMessage,
++	clientProxy func(serverPort net.Port) *serial.TypedMessage,
++) {
++	t.Helper()
++	backend := tcp.Server{MsgProcessor: xor}
++	destination, err := backend.Start()
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer backend.Close()
++
++	serverPort := tcp.PickPort()
++	commandPort := tcp.PickPort()
++	clientPort := tcp.PickPort()
++	serverConfig := &core.Config{
++		App: []*serial.TypedMessage{
++			serial.ToTypedMessage(&commander.Config{
++				Tag:     "api",
++				Service: []*serial.TypedMessage{serial.ToTypedMessage(&command.Config{})},
++			}),
++			serial.ToTypedMessage(&router.Config{
++				Rule: []*router.RoutingRule{{
++					InboundTag: []string{"api"},
++					TargetTag:  &router.RoutingRule_Tag{Tag: "api"},
++				}},
++			}),
++			serial.ToTypedMessage(&policy.Config{
++				Level: map[uint32]*policy.Policy{
++					0: {Timeout: &policy.Policy_Timeout{
++						UplinkOnly:   &policy.Second{Value: 0},
++						DownlinkOnly: &policy.Second{Value: 0},
++					}},
++				},
++			}),
++		},
++		Inbound: []*core.InboundHandlerConfig{
++			{
++				Tag: inboundTag,
++				ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
++					PortList: &net.PortList{Range: []*net.PortRange{net.SinglePortRange(serverPort)}},
++					Listen:   net.NewIPOrDomain(net.LocalHostIP),
++				}),
++				ProxySettings: serverProxy,
++			},
++			{
++				Tag: "api",
++				ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
++					PortList: &net.PortList{Range: []*net.PortRange{net.SinglePortRange(commandPort)}},
++					Listen:   net.NewIPOrDomain(net.LocalHostIP),
++				}),
++				ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
++					RewriteAddress:  net.NewIPOrDomain(destination.Address),
++					RewritePort:     uint32(destination.Port),
++					AllowedNetworks: []net.Network{net.Network_TCP},
++				}),
++			},
++		},
++		Outbound: []*core.OutboundHandlerConfig{{
++			ProxySettings: serial.ToTypedMessage(&freedom.Config{
++				FinalRules: []*freedom.FinalRuleConfig{{Action: freedom.RuleAction_Allow}},
++			}),
++		}},
++	}
++	clientConfig := &core.Config{
++		Inbound: []*core.InboundHandlerConfig{{
++			ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
++				PortList: &net.PortList{Range: []*net.PortRange{net.SinglePortRange(clientPort)}},
++				Listen:   net.NewIPOrDomain(net.LocalHostIP),
++			}),
++			ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
++				RewriteAddress:  net.NewIPOrDomain(destination.Address),
++				RewritePort:     uint32(destination.Port),
++				AllowedNetworks: []net.Network{net.Network_TCP},
++			}),
++		}},
++		Outbound: []*core.OutboundHandlerConfig{{ProxySettings: clientProxy(serverPort)}},
++	}
++
++	servers, err := InitializeServerConfigs(serverConfig, clientConfig)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer CloseAllServers(servers)
++
++	connection, err := net.DialTCP("tcp", nil, &net.TCPAddr{
++		IP:   []byte{127, 0, 0, 1},
++		Port: int(clientPort),
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer connection.Close()
++	if err := testTCPConn2(connection, 4096, 3*time.Second)(); err != nil {
++		t.Fatalf("managed user did not establish a long-lived stream: %v", err)
++	}
++
++	commandConn, err := grpc.Dial(
++		fmt.Sprintf("127.0.0.1:%d", commandPort),
++		grpc.WithTransportCredentials(insecure.NewCredentials()),
++		grpc.WithBlock(),
++	)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer commandConn.Close()
++	response, err := command.NewHandlerServiceClient(commandConn).AlterInbound(
++		context.Background(),
++		&command.AlterInboundRequest{
++			Tag:       inboundTag,
++			Operation: serial.ToTypedMessage(&command.RemoveUserOperation{Email: email}),
++		},
++	)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if response == nil {
++		t.Fatal("nil RemoveUser response")
++	}
++
++	if err := testTCPConn2(connection, 1024, 3*time.Second)(); err == nil {
++		t.Fatal("removed user's already-authenticated stream remained usable")
++	}
++	if err := testTCPConn(clientPort, 1024, 3*time.Second)(); err == nil {
++		t.Fatal("removed credential established a new stream")
++	}
++}
++
++func TestCommanderRemoveVMessUserInterruptsActiveConnection(t *testing.T) {
++	const email = "vmess-active-revoke@example.com"
++	userID := protocol.NewID(uuid.New()).String()
++	runManagedUserActiveRevokeScenario(
++		t,
++		"vmess",
++		email,
++		serial.ToTypedMessage(&vmessinbound.Config{User: []*protocol.User{{
++			Email:   email,
++			Account: serial.ToTypedMessage(&vmess.Account{Id: userID}),
++		}}}),
++		func(serverPort net.Port) *serial.TypedMessage {
++			return serial.ToTypedMessage(&vmessoutbound.Config{
++				Receiver: &protocol.ServerEndpoint{
++					Address: net.NewIPOrDomain(net.LocalHostIP),
++					Port:    uint32(serverPort),
++					User: &protocol.User{Account: serial.ToTypedMessage(&vmess.Account{
++						Id: userID,
++						SecuritySettings: &protocol.SecurityConfig{
++							Type: protocol.SecurityType_AES128_GCM,
++						},
++					})},
++				},
++			})
++		},
++	)
++}
++
++func TestCommanderRemoveShadowsocksUserInterruptsActiveConnection(t *testing.T) {
++	const (
++		email    = "shadowsocks-active-revoke@example.com"
++		password = "shadowsocks-active-revoke-password"
++	)
++	account := &shadowsocks.Account{
++		Password:   password,
++		CipherType: shadowsocks.CipherType_CHACHA20_POLY1305,
++	}
++	runManagedUserActiveRevokeScenario(
++		t,
++		"shadowsocks",
++		email,
++		serial.ToTypedMessage(&shadowsocks.ServerConfig{
++			Users:   []*protocol.User{{Email: email, Account: serial.ToTypedMessage(account)}},
++			Network: []net.Network{net.Network_TCP},
++		}),
++		func(serverPort net.Port) *serial.TypedMessage {
++			return serial.ToTypedMessage(&shadowsocks.ClientConfig{
++				Server: &protocol.ServerEndpoint{
++					Address: net.NewIPOrDomain(net.LocalHostIP),
++					Port:    uint32(serverPort),
++					User:    &protocol.User{Account: serial.ToTypedMessage(account)},
++				},
++			})
++		},
++	)
++}
++
++func TestCommanderRemoveShadowsocksUserInterruptsActiveUDPSession(t *testing.T) {
++	backend := udp.Server{MsgProcessor: xor}
++	destination, err := backend.Start()
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer backend.Close()
++
++	const (
++		email    = "shadowsocks-udp-active-revoke@example.com"
++		password = "shadowsocks-udp-active-revoke-password"
++	)
++	account := &shadowsocks.Account{
++		Password:   password,
++		CipherType: shadowsocks.CipherType_AES_128_GCM,
++	}
++	serverPort := udp.PickPort()
++	commandPort := tcp.PickPort()
++	clientPort := udp.PickPort()
++	serverConfig := &core.Config{
++		App: []*serial.TypedMessage{
++			serial.ToTypedMessage(&commander.Config{
++				Tag:     "api",
++				Service: []*serial.TypedMessage{serial.ToTypedMessage(&command.Config{})},
++			}),
++			serial.ToTypedMessage(&router.Config{
++				Rule: []*router.RoutingRule{{
++					InboundTag: []string{"api"},
++					TargetTag:  &router.RoutingRule_Tag{Tag: "api"},
++				}},
++			}),
++		},
++		Inbound: []*core.InboundHandlerConfig{
++			{
++				Tag: "shadowsocks-udp",
++				ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
++					PortList: &net.PortList{Range: []*net.PortRange{net.SinglePortRange(serverPort)}},
++					Listen:   net.NewIPOrDomain(net.LocalHostIP),
++				}),
++				ProxySettings: serial.ToTypedMessage(&shadowsocks.ServerConfig{
++					Users:   []*protocol.User{{Email: email, Account: serial.ToTypedMessage(account)}},
++					Network: []net.Network{net.Network_UDP},
++				}),
++			},
++			{
++				Tag: "api",
++				ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
++					PortList: &net.PortList{Range: []*net.PortRange{net.SinglePortRange(commandPort)}},
++					Listen:   net.NewIPOrDomain(net.LocalHostIP),
++				}),
++				ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
++					RewriteAddress:  net.NewIPOrDomain(destination.Address),
++					RewritePort:     uint32(destination.Port),
++					AllowedNetworks: []net.Network{net.Network_TCP},
++				}),
++			},
++		},
++		Outbound: []*core.OutboundHandlerConfig{{
++			ProxySettings: serial.ToTypedMessage(&freedom.Config{
++				FinalRules: []*freedom.FinalRuleConfig{{Action: freedom.RuleAction_Allow}},
++			}),
++		}},
++	}
++	clientConfig := &core.Config{
++		Inbound: []*core.InboundHandlerConfig{{
++			ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
++				PortList: &net.PortList{Range: []*net.PortRange{net.SinglePortRange(clientPort)}},
++				Listen:   net.NewIPOrDomain(net.LocalHostIP),
++			}),
++			ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
++				RewriteAddress:  net.NewIPOrDomain(destination.Address),
++				RewritePort:     uint32(destination.Port),
++				AllowedNetworks: []net.Network{net.Network_UDP},
++			}),
++		}},
++		Outbound: []*core.OutboundHandlerConfig{{
++			ProxySettings: serial.ToTypedMessage(&shadowsocks.ClientConfig{
++				Server: &protocol.ServerEndpoint{
++					Address: net.NewIPOrDomain(net.LocalHostIP),
++					Port:    uint32(serverPort),
++					User:    &protocol.User{Account: serial.ToTypedMessage(account)},
++				},
++			}),
++		}},
++	}
++
++	servers, err := InitializeServerConfigs(serverConfig, clientConfig)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer CloseAllServers(servers)
++	connection, err := net.DialUDP("udp", nil, &net.UDPAddr{
++		IP:   []byte{127, 0, 0, 1},
++		Port: int(clientPort),
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer connection.Close()
++	if err := testTCPConn2(connection, 1024, 3*time.Second)(); err != nil {
++		t.Fatalf("Shadowsocks user did not establish a UDP session: %v", err)
++	}
++
++	commandConn, err := grpc.Dial(
++		fmt.Sprintf("127.0.0.1:%d", commandPort),
++		grpc.WithTransportCredentials(insecure.NewCredentials()),
++		grpc.WithBlock(),
++	)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer commandConn.Close()
++	response, err := command.NewHandlerServiceClient(commandConn).AlterInbound(
++		context.Background(),
++		&command.AlterInboundRequest{
++			Tag:       "shadowsocks-udp",
++			Operation: serial.ToTypedMessage(&command.RemoveUserOperation{Email: email}),
++		},
++	)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if response == nil {
++		t.Fatal("nil Shadowsocks UDP RemoveUser response")
++	}
++	if err := testTCPConn2(connection, 1024, 3*time.Second)(); err == nil {
++		t.Fatal("removed user's authenticated Shadowsocks UDP session remained usable")
++	}
++	if err := testUDPConn(clientPort, 1024, 3*time.Second)(); err == nil {
++		t.Fatal("removed Shadowsocks credential established a new UDP session")
++	}
++}
