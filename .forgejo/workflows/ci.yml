@@ -44,6 +44,10 @@ jobs:
             echo 'A retired full Xray fork is referenced' >&2
             exit 1
           fi
+          if git grep -n -I -E -- 'api\.github\.com|raw\.githubusercontent\.com' -- scripts/release_pipeline.py; then
+            echo 'Release discovery must use the official Atom feed and Git tag, not GitHub API/raw endpoints' >&2
+            exit 1
+          fi
 
       - name: Apply and test the patches on official XTLS source
         run: scripts/test-patches.sh

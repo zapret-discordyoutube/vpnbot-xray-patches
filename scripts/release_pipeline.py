@@ -12,10 +12,12 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -23,9 +25,9 @@ from typing import Any, Iterable
 SCHEMA_VERSION = 1
 CAPABILITY = "vpnbot-active-revoke-v3"
 OFFICIAL_REPOSITORY = "https://github.com/XTLS/Xray-core.git"
-OFFICIAL_RELEASES_API = "https://api.github.com/repos/XTLS/Xray-core/releases?per_page=30"
-OFFICIAL_COMMITS_API = "https://api.github.com/repos/XTLS/Xray-core/commits"
-OFFICIAL_RAW_BASE = "https://raw.githubusercontent.com/XTLS/Xray-core"
+OFFICIAL_RELEASES_FEED = "https://github.com/XTLS/Xray-core/releases.atom"
+OFFICIAL_RELEASE_TAG_PATH = "/XTLS/Xray-core/releases/tag/"
+ATOM_NAMESPACE = "http://www.w3.org/2005/Atom"
 MANIFEST_NAME = "vpnbot-xray-release-manifest.json"
 PROOF_NAME = "vpnbot-xray-pilot-proof.json"
 TAG_RE = re.compile(r"^v(?P<version>[0-9]+(?:\.[0-9]+){2})$")
@@ -76,10 +78,11 @@ def request_bytes(
     method: str = "GET",
     payload: bytes | None = None,
     content_type: str = "application/json",
+    accept: str = "application/json",
     timeout: int = 90,
 ) -> bytes:
     headers = {
-        "Accept": "application/json",
+        "Accept": accept,
         "User-Agent": "vpnbot-xray-release-pipeline/1",
     }
     if token:
@@ -163,78 +166,89 @@ def git_output(repository_root: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
-def resolve_official_tag(tag: str) -> str:
+def latest_official_release() -> str:
+    raw = request_bytes(
+        OFFICIAL_RELEASES_FEED,
+        accept="application/atom+xml, application/xml;q=0.9",
+    )
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError as exc:
+        raise PipelineError("official Xray release feed is invalid XML") from exc
+    if root.tag != f"{{{ATOM_NAMESPACE}}}feed":
+        raise PipelineError("official Xray release feed has an unexpected root")
+
+    for entry in root.findall(f"{{{ATOM_NAMESPACE}}}entry"):
+        for link in entry.findall(f"{{{ATOM_NAMESPACE}}}link"):
+            if str(link.get("rel") or "alternate") != "alternate":
+                continue
+            href = str(link.get("href") or "").strip()
+            parsed = urllib.parse.urlsplit(href)
+            if (
+                parsed.scheme != "https"
+                or parsed.netloc.lower() != "github.com"
+                or parsed.query
+                or parsed.fragment
+                or not parsed.path.startswith(OFFICIAL_RELEASE_TAG_PATH)
+            ):
+                continue
+            tag = urllib.parse.unquote(parsed.path.removeprefix(OFFICIAL_RELEASE_TAG_PATH))
+            if "/" not in tag and TAG_RE.fullmatch(tag):
+                return tag
+    raise PipelineError("official Xray release feed contains no safe release tag")
+
+
+def _run_git(repository: Path, *args: str, timeout: int = 180) -> str:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repository), *args],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise PipelineError(f"git {' '.join(args)} failed: {exc}") from exc
+    if result.returncode != 0:
+        raise PipelineError(result.stderr.strip() or f"git {' '.join(args)} failed")
+    return result.stdout.strip()
+
+
+def official_git_metadata(tag: str) -> tuple[str, int, str, str]:
     if not TAG_RE.fullmatch(tag):
         raise PipelineError(f"invalid official Xray tag: {tag}")
-    result = subprocess.run(
-        [
-            "git",
-            "ls-remote",
-            OFFICIAL_REPOSITORY,
-            f"refs/tags/{tag}",
-            f"refs/tags/{tag}^{{}}",
-        ],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=90,
-    )
-    if result.returncode != 0:
-        raise PipelineError(result.stderr.strip() or f"cannot resolve official tag {tag}")
-    direct = ""
-    peeled = ""
-    for line in result.stdout.splitlines():
-        fields = line.split()
-        if len(fields) != 2:
-            continue
-        commit, ref = fields
+    with tempfile.TemporaryDirectory(prefix="vpnbot-xray-official-") as raw_tmp:
+        repository = Path(raw_tmp) / "xray"
+        repository.mkdir(mode=0o700)
+        _run_git(repository, "init", "-q")
+        _run_git(repository, "remote", "add", "origin", OFFICIAL_REPOSITORY)
+        _run_git(
+            repository,
+            "fetch",
+            "--quiet",
+            "--depth",
+            "1",
+            "origin",
+            f"refs/tags/{tag}:refs/tags/{tag}",
+        )
+        commit = _run_git(repository, "rev-parse", f"{tag}^{{commit}}")
         if not HEX40_RE.fullmatch(commit):
-            continue
-        if ref == f"refs/tags/{tag}^{{}}":
-            peeled = commit
-        elif ref == f"refs/tags/{tag}":
-            direct = commit
-    commit = peeled or direct
-    if not commit:
-        raise PipelineError(f"official tag does not exist: {tag}")
-    return commit
+            raise PipelineError(f"official tag {tag} did not resolve to a full commit")
+        raw_epoch = _run_git(repository, "show", "-s", "--format=%ct", commit)
+        if not raw_epoch.isdigit() or int(raw_epoch) <= 0:
+            raise PipelineError(f"official commit {commit} has an invalid timestamp")
+        epoch = int(raw_epoch)
+        go_mod = _run_git(repository, "show", f"{commit}:go.mod")
 
-
-def latest_official_release() -> tuple[str, bool]:
-    releases = request_json(OFFICIAL_RELEASES_API)
-    if not isinstance(releases, list):
-        raise PipelineError("official GitHub releases API did not return a list")
-    for item in releases:
-        if not isinstance(item, dict) or item.get("draft"):
-            continue
-        tag = str(item.get("tag_name") or "").strip()
-        if TAG_RE.fullmatch(tag):
-            return tag, bool(item.get("prerelease"))
-    raise PipelineError("no suitable official Xray release was found")
-
-
-def commit_metadata(commit: str) -> tuple[int, str]:
-    if not HEX40_RE.fullmatch(commit):
-        raise PipelineError(f"invalid official commit: {commit}")
-    payload = request_json(f"{OFFICIAL_COMMITS_API}/{commit}")
-    try:
-        raw_date = payload["commit"]["committer"]["date"]
-    except (KeyError, TypeError) as exc:
-        raise PipelineError("official commit response lacks committer date") from exc
-    try:
-        parsed = dt.datetime.fromisoformat(str(raw_date).replace("Z", "+00:00"))
-    except ValueError as exc:
-        raise PipelineError(f"invalid official commit date: {raw_date}") from exc
-    epoch = int(parsed.timestamp())
-    return epoch, parsed.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def official_go_version(commit: str) -> str:
-    raw = request_bytes(f"{OFFICIAL_RAW_BASE}/{commit}/go.mod").decode("utf-8", errors="strict")
-    match = re.search(r"(?m)^go\s+([0-9]+\.[0-9]+(?:\.[0-9]+)?)\s*$", raw)
+    match = re.search(r"(?m)^go\s+([0-9]+\.[0-9]+(?:\.[0-9]+)?)\s*$", go_mod)
     if not match:
         raise PipelineError("official go.mod does not declare a Go version")
-    return match.group(1)
+    commit_time = (
+        dt.datetime.fromtimestamp(epoch, tz=dt.timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    return commit, epoch, commit_time, match.group(1)
 
 
 def release_assets(release: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -296,10 +310,8 @@ def discover(args: argparse.Namespace) -> int:
     repository_root = args.repository_root.resolve()
     patches = read_patch_rows(repository_root)
     patchset = patchset_sha256(patches)
-    upstream_tag, official_prerelease = latest_official_release()
-    upstream_commit = resolve_official_tag(upstream_tag)
-    epoch, commit_time = commit_metadata(upstream_commit)
-    go_version = official_go_version(upstream_commit)
+    upstream_tag = latest_official_release()
+    upstream_commit, epoch, commit_time, go_version = official_git_metadata(upstream_tag)
     patch_commit = git_output(repository_root, "rev-parse", "HEAD")
     if not HEX40_RE.fullmatch(patch_commit):
         raise PipelineError("patch repository HEAD is not a full commit SHA")
@@ -377,7 +389,7 @@ def discover(args: argparse.Namespace) -> int:
 
     metadata = {
         "action": action,
-        "official_prerelease": official_prerelease,
+        "official_release_feed": OFFICIAL_RELEASES_FEED,
         "upstream": {
             "repository": OFFICIAL_REPOSITORY,
             "tag": upstream_tag,

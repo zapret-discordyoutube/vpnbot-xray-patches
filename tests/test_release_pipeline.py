@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -55,6 +56,89 @@ class ReleasePipelineTests(unittest.TestCase):
         rows = release_pipeline.read_patch_rows(ROOT)
         self.assertEqual(len(rows), 3)
         self.assertRegex(release_pipeline.patchset_sha256(rows), r"^[0-9a-f]{64}$")
+
+    def test_latest_official_release_uses_only_safe_atom_link(self) -> None:
+        feed = b"""<?xml version='1.0' encoding='UTF-8'?>
+<feed xmlns='http://www.w3.org/2005/Atom'>
+  <entry>
+    <link rel='alternate' href='https://attacker.invalid/XTLS/Xray-core/releases/tag/v99.1.1'/>
+  </entry>
+  <entry>
+    <link rel='alternate' href='https://github.com/XTLS/Xray-core/releases/tag/v26.7.28'/>
+  </entry>
+</feed>
+"""
+        with mock.patch.object(release_pipeline, "request_bytes", return_value=feed) as request:
+            self.assertEqual(release_pipeline.latest_official_release(), "v26.7.28")
+        request.assert_called_once_with(
+            release_pipeline.OFFICIAL_RELEASES_FEED,
+            accept="application/atom+xml, application/xml;q=0.9",
+        )
+
+    def test_latest_official_release_rejects_invalid_feed(self) -> None:
+        with mock.patch.object(release_pipeline, "request_bytes", return_value=b"not xml"):
+            with self.assertRaisesRegex(release_pipeline.PipelineError, "invalid XML"):
+                release_pipeline.latest_official_release()
+
+    def test_official_git_metadata_comes_from_exact_temporary_tag(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            upstream = Path(raw_tmp) / "upstream"
+            upstream.mkdir()
+            subprocess.run(["git", "-C", str(upstream), "init", "-q"], check=True)
+            (upstream / "go.mod").write_text(
+                "module github.com/xtls/xray-core\n\ngo 1.26.4\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "-C", str(upstream), "add", "go.mod"], check=True)
+            environment = dict(os.environ)
+            environment.update(
+                {
+                    "GIT_AUTHOR_DATE": "2026-07-28T07:59:48+00:00",
+                    "GIT_COMMITTER_DATE": "2026-07-28T07:59:48+00:00",
+                }
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(upstream),
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "official tag",
+                ],
+                check=True,
+                env=environment,
+            )
+            subprocess.run(
+                ["git", "-C", str(upstream), "tag", "v26.7.28"], check=True
+            )
+            expected_commit = subprocess.check_output(
+                ["git", "-C", str(upstream), "rev-parse", "HEAD"], text=True
+            ).strip()
+
+            with mock.patch.object(release_pipeline, "OFFICIAL_REPOSITORY", str(upstream)):
+                commit, epoch, commit_time, go_version = (
+                    release_pipeline.official_git_metadata("v26.7.28")
+                )
+
+        self.assertEqual(commit, expected_commit)
+        self.assertEqual(epoch, 1785225588)
+        self.assertEqual(commit_time, "2026-07-28T07:59:48Z")
+        self.assertEqual(go_version, "1.26.4")
+
+    def test_official_git_failure_is_fail_closed(self) -> None:
+        with mock.patch.object(
+            release_pipeline.subprocess,
+            "run",
+            side_effect=subprocess.TimeoutExpired(["git", "fetch"], 180),
+        ):
+            with self.assertRaisesRegex(release_pipeline.PipelineError, "git init"):
+                release_pipeline.official_git_metadata("v26.7.28")
 
     def test_manifest_rejects_candidate_that_does_not_belong_to_proven(self) -> None:
         manifest = {

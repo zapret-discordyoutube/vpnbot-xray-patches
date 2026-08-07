@@ -25,10 +25,13 @@ VLESS, Trojan, VMess и Shadowsocks-сессии этого пользовате
 
 ## Автоматические dev-релизы
 
-Workflow `Follow official Xray dev releases` каждые шесть часов проверяет
-официальные GitHub Releases `XTLS/Xray-core`. Официальный prerelease/dev-тег
-для него является нормальным входом, но не становится стабильным релизом
-VPnBot сразу.
+Workflow `Follow official Xray dev releases` каждые шесть часов читает
+официальный `XTLS/Xray-core/releases.atom`, после чего временным shallow
+Git-fetch получает ровно найденный тег, его commit, время и `go.mod`.
+GitHub API, API-токен, подвижная ветка `main` и постоянная локальная копия
+Xray-core для discovery не используются. Официальный prerelease/dev-тег для
+него является нормальным входом, но не становится стабильным релизом VPnBot
+сразу.
 
 Цепочка разделена на два состояния:
 
