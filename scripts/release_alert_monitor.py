@@ -35,6 +35,19 @@ PENDING_WORKFLOW_STATES = {
 PROMOTER_PENDING_PHASES = {"installing", "installed", "pilot_passed", "promoted"}
 PROMOTER_FAILED_PHASES = {"failed_rolled_back", "failed_rollback_failed"}
 CONDITION_NAMES = ("patch_pipeline", "candidate_stalled", "canary_failed")
+ALERT_ENV_NAMES = {
+    "VPNBOT_XRAY_ALERT_ACTIONS_URL",
+    "VPNBOT_XRAY_ALERT_RELEASES_URL",
+    "VPNBOT_XRAY_ALERT_WORKFLOW_ID",
+    "VPNBOT_XRAY_ALERT_BOT_ENV_FILE",
+    "VPNBOT_XRAY_ALERT_CHAT_ID",
+    "VPNBOT_XRAY_ALERT_PROMOTER_STATE_DIR",
+    "VPNBOT_XRAY_ALERT_STATE_DIR",
+    "VPNBOT_XRAY_ALERT_STALL_SECONDS",
+    "VPNBOT_XRAY_ALERT_REMINDER_SECONDS",
+    "VPNBOT_XRAY_ALERT_RETRY_SECONDS",
+    "VPNBOT_XRAY_ALERT_REQUEST_TIMEOUT_SECONDS",
+}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -187,6 +200,37 @@ def parse_env_value(raw: str, label: str) -> str:
     if len(parts) != 1:
         raise release_pipeline.PipelineError(f"invalid {label} value")
     return parts[0]
+
+
+def load_alert_environment(path: Path | None = None) -> None:
+    configured = path or Path(
+        env("VPNBOT_XRAY_ALERT_ENV_FILE", "/etc/vpnbot-xray-release-alert.env")
+    )
+    if not configured.is_absolute():
+        raise release_pipeline.PipelineError("release alert env path must be absolute")
+    require_safe_regular_file(configured, "release alert env")
+    seen: set[str] = set()
+    for number, raw_line in enumerate(
+        configured.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            raise release_pipeline.PipelineError(
+                f"invalid release alert env row {number}"
+            )
+        name, raw_value = line.split("=", 1)
+        name = name.strip()
+        if name not in ALERT_ENV_NAMES or name in seen:
+            raise release_pipeline.PipelineError(
+                f"unknown or duplicate release alert env name at row {number}: {name}"
+            )
+        seen.add(name)
+        os.environ.setdefault(
+            name,
+            parse_env_value(raw_value.strip(), f"{name} at line {number}"),
+        )
 
 
 def load_bot_token(path: Path) -> str:
@@ -669,6 +713,7 @@ def main() -> int:
     )
     args = parser.parse_args()
     try:
+        load_alert_environment()
         settings = load_settings()
         now_epoch = int(time.time())
         conditions = collect_conditions(settings, now_epoch)

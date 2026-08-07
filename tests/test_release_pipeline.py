@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -329,6 +330,33 @@ class ReleasePipelineTests(unittest.TestCase):
                 [candidate_release, proven_release]
             )
         self.assertEqual(candidates, [])
+
+    def test_direct_monitor_loads_only_known_root_only_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            env_path = Path(raw_tmp) / "release-alert.env"
+            env_path.write_text(
+                "VPNBOT_XRAY_ALERT_CHAT_ID=6483277608\n"
+                "VPNBOT_XRAY_ALERT_STALL_SECONDS='7200'\n",
+                encoding="utf-8",
+            )
+            env_path.chmod(0o600)
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "VPNBOT_XRAY_ALERT_CHAT_ID": "",
+                    "VPNBOT_XRAY_ALERT_STALL_SECONDS": "",
+                },
+                clear=False,
+            ):
+                os.environ.pop("VPNBOT_XRAY_ALERT_CHAT_ID")
+                os.environ.pop("VPNBOT_XRAY_ALERT_STALL_SECONDS")
+                release_alert_monitor.load_alert_environment(env_path)
+                self.assertEqual(
+                    os.environ["VPNBOT_XRAY_ALERT_CHAT_ID"], "6483277608"
+                )
+                self.assertEqual(
+                    os.environ["VPNBOT_XRAY_ALERT_STALL_SECONDS"], "7200"
+                )
 
 
 if __name__ == "__main__":
