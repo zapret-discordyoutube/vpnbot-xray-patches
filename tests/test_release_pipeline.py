@@ -358,6 +358,13 @@ class ReleasePipelineTests(unittest.TestCase):
                     os.environ["VPNBOT_XRAY_ALERT_STALL_SECONDS"], "7200"
                 )
 
+    def test_monitor_lock_is_root_only(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            lock_path = Path(raw_tmp) / "monitor.lock"
+            with release_alert_monitor.monitor_lock(lock_path) as lock:
+                self.assertFalse(lock.closed)
+                self.assertEqual(lock_path.stat().st_mode & 0o777, 0o600)
+
 
 if __name__ == "__main__":
     unittest.main()

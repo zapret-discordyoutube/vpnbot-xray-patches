@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import datetime as dt
 import fcntl
@@ -19,6 +20,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
+sys.dont_write_bytecode = True
 import release_pipeline
 
 
@@ -699,6 +701,14 @@ def status_payload(conditions: list[Condition]) -> dict[str, Any]:
     }
 
 
+@contextlib.contextmanager
+def monitor_lock(path: Path) -> Any:
+    with path.open("w", encoding="utf-8") as lock:
+        os.fchmod(lock.fileno(), 0o600)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield lock
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -734,9 +744,7 @@ def main() -> int:
         settings.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         settings.state_dir.chmod(0o700)
         lock_path = settings.state_dir / "monitor.lock"
-        with lock_path.open("w", encoding="utf-8") as lock:
-            lock.chmod(0o600)
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with monitor_lock(lock_path):
             state = reconcile(settings, conditions, send, now_epoch)
         active = sorted(
             name
