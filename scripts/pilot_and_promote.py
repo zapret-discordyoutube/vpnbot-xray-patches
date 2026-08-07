@@ -56,7 +56,7 @@ def load_settings() -> Settings:
         canary_user=env("VPNBOT_XRAY_CANARY_SSH_USER", "root"),
         identity_file=Path(env("VPNBOT_XRAY_CANARY_IDENTITY_FILE", "/root/.ssh/id_ed25519")),
         known_hosts_file=Path(env("VPNBOT_XRAY_CANARY_KNOWN_HOSTS_FILE", "/root/.ssh/known_hosts")),
-        updater_path=env("VPNBOT_XRAY_CANARY_UPDATER", "/usr/local/sbin/vpnbot-xray-core-updater"),
+        updater_path=env("VPNBOT_XRAY_CANARY_UPDATER", "/usr/local/bin/vpnbot-xray-core-updater"),
         xray_path=env("VPNBOT_XRAY_CANARY_BINARY", "/opt/vpnbot/xray-core/bin/xray"),
         config_dir=env("VPNBOT_XRAY_CANARY_CONFIG_DIR", "/opt/vpnbot/xray-core/config"),
         service_name=env("VPNBOT_XRAY_CANARY_SERVICE", "vpnbot-xray.service"),
@@ -236,6 +236,41 @@ def ensure_previous_is_proven(settings: Settings, token: str, tag: str) -> None:
         )
 
 
+def resolve_previous_proven_tag(
+    settings: Settings,
+    token: str,
+    version_statement: str,
+) -> str:
+    if release_pipeline.CAPABILITY not in version_statement:
+        raise release_pipeline.PipelineError(
+            "canary current Xray lacks the required active-revoke capability"
+        )
+    exact = re.search(r"v[0-9]+(?:\.[0-9]+){2}-vpnbot\.[1-9][0-9]*", version_statement)
+    if exact:
+        tag = exact.group(0)
+        ensure_previous_is_proven(settings, token, tag)
+        return tag
+    numeric = re.search(r"\bXray\s+([0-9]+(?:\.[0-9]+){2})\b", version_statement)
+    if not numeric:
+        raise release_pipeline.PipelineError(
+            "cannot map the canary current Xray version to a proven rollback release"
+        )
+    prefix = f"v{numeric.group(1)}-vpnbot."
+    releases = release_pipeline.list_forgejo_releases(settings.releases_url, token=token)
+    for release in releases:
+        tag = str(release.get("tag_name") or "")
+        if (
+            not release.get("draft")
+            and not release.get("prerelease")
+            and release_pipeline.PROVEN_RE.fullmatch(tag)
+            and tag.startswith(prefix)
+        ):
+            return tag
+    raise release_pipeline.PipelineError(
+        f"no proven rollback release matches installed Xray {numeric.group(1)}"
+    )
+
+
 def run_canary(settings: Settings, expected_proven_tag: str) -> dict[str, Any]:
     script = settings.canary_script.read_bytes()
     result = remote_command(
@@ -341,8 +376,11 @@ def process_candidate(
         return
 
     release_pipeline.validated_candidate_payloads(candidate, token=token)
-    current_statement, current_tag = remote_version(settings)
-    previous_tag = str(state.get("previous_proven_tag") or current_tag)
+    current_statement, _ = remote_version(settings)
+    previous_tag = str(
+        state.get("previous_proven_tag")
+        or resolve_previous_proven_tag(settings, token, current_statement)
+    )
     ensure_previous_is_proven(settings, token, previous_tag)
     state = {
         "schema_version": 1,

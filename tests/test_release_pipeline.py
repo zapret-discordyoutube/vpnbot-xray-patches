@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -13,7 +15,15 @@ SPEC = importlib.util.spec_from_file_location(
 )
 assert SPEC and SPEC.loader
 release_pipeline = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = release_pipeline
 SPEC.loader.exec_module(release_pipeline)
+PROMOTER_SPEC = importlib.util.spec_from_file_location(
+    "pilot_and_promote", ROOT / "scripts" / "pilot_and_promote.py"
+)
+assert PROMOTER_SPEC and PROMOTER_SPEC.loader
+pilot_and_promote = importlib.util.module_from_spec(PROMOTER_SPEC)
+sys.modules[PROMOTER_SPEC.name] = pilot_and_promote
+PROMOTER_SPEC.loader.exec_module(pilot_and_promote)
 
 
 class ReleasePipelineTests(unittest.TestCase):
@@ -75,6 +85,36 @@ class ReleasePipelineTests(unittest.TestCase):
             self.assertEqual(path.read_bytes(), b"{}\n")
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
             self.assertEqual(list(path.parent.glob(".*.new")), [])
+
+    def test_legacy_version_statement_maps_to_latest_same_base_proven(self) -> None:
+        settings = pilot_and_promote.Settings(
+            releases_url="https://forgejo.invalid/releases",
+            token_file=Path("/token"),
+            canary_node="canary",
+            canary_host="127.0.0.1",
+            canary_port=10222,
+            canary_user="root",
+            identity_file=Path("/key"),
+            known_hosts_file=Path("/known_hosts"),
+            updater_path="/usr/local/bin/vpnbot-xray-core-updater",
+            xray_path="/opt/vpnbot/xray-core/bin/xray",
+            config_dir="/opt/vpnbot/xray-core/config",
+            service_name="vpnbot-xray.service",
+            state_dir=Path("/state"),
+            canary_script=Path("/canary.py"),
+            timeout_seconds=900,
+        )
+        releases = [
+            {"tag_name": "v26.8.1-vpnbot.1", "draft": False, "prerelease": False},
+            {"tag_name": "v26.7.28-vpnbot.3", "draft": False, "prerelease": False},
+        ]
+        statement = (
+            "Xray 26.7.28 (Xray, Penetrates Everything.) 0d9b32c (go1.26.4 linux/amd64)\n"
+            "VPnBot capability: vpnbot-active-revoke-v3"
+        )
+        with mock.patch.object(release_pipeline, "list_forgejo_releases", return_value=releases):
+            tag = pilot_and_promote.resolve_previous_proven_tag(settings, "token", statement)
+        self.assertEqual(tag, "v26.7.28-vpnbot.3")
 
 
 if __name__ == "__main__":
