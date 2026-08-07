@@ -1,0 +1,12 @@
+[Unit]
+Description=Check the VPnBot Xray release train and notify the operator
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+RandomizedDelaySec=1min
+Persistent=true
+Unit=vpnbot-xray-release-alert.service
+
+[Install]
+WantedBy=timers.target

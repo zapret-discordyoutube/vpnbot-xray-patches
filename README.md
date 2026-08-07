@@ -65,6 +65,31 @@ scripts/install_promoter.sh
 Forgejo-токен с областью `write:repository`. Токен, SSH-ключ и состояние пилота
 не хранятся в Git.
 
+Тот же установщик добавляет независимый наблюдатель
+`vpnbot-xray-release-alert.timer`. Он раз в пять минут проверяет последний
+`candidate.yml`, возраст опубликованных candidate без proven и root-only
+состояние canary. Оператор получает Telegram-сообщение при безопасной остановке
+выпуска, редкое напоминание для продолжающейся аварии и отдельное сообщение о
+подтверждённом восстановлении. Переходный retry workflow или canary не считается
+восстановлением.
+
+Для наблюдателя нужен `/etc/vpnbot-xray-release-alert.env` по отдельному примеру
+из `systemd/`. В нём нет токена Telegram: скрипт читает только
+`VPNBOT_BOT_TOKEN` из существующего root-only runtime-env VPnBot. Долговечное
+состояние дедупликации хранится в
+`/var/lib/vpnbot-xray-release-alert/state.json` и никак не участвует в решении о
+публикации proven.
+
+Режимы ручной проверки после установки:
+
+```bash
+sudo -n /usr/local/libexec/vpnbot-xray-release-promoter/release_alert_monitor.py --print-status
+sudo -n /usr/local/libexec/vpnbot-xray-release-promoter/release_alert_monitor.py --send-test
+```
+
+Первый вызов ничего не отправляет и не меняет incident-state. Второй отправляет
+одно явно помеченное тестовое сообщение и тоже не создаёт ложную аварию.
+
 ## Локальная проверка
 
 ```bash
