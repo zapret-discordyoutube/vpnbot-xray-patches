@@ -47,7 +47,7 @@ def load_settings() -> Settings:
     settings = Settings(
         releases_url=env(
             "VPNBOT_XRAY_FORGEJO_RELEASES_URL",
-            "https://git.zapret.moe/api/v1/repos/zapretdiscordyoutube/vpnbot-xray-patches/releases",
+            "https://git.zapret.moe/api/v1/repos/zapretkvn/vpnbot-xray-patches/releases",
         ),
         token_file=Path(env("VPNBOT_XRAY_FORGEJO_TOKEN_FILE")),
         canary_node=env("VPNBOT_XRAY_CANARY_NODE"),

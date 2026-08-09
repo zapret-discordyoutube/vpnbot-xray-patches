@@ -290,6 +290,77 @@ class ReleasePipelineTests(unittest.TestCase):
             "healthy",
         )
 
+    def test_release_alert_reads_structured_public_run_when_api_is_empty(self) -> None:
+        listing = """
+        <div class="flex-item tw-items-center">
+          <div><a href="/zapretkvn/vpnbot-xray-patches/actions/runs/25">run</a></div>
+          <b>#25</b>
+          <a class="ui label run-list-ref gt-ellipsis" data-tooltip-content="main">main</a>
+          <relative-time datetime="2026-08-09T09:17:31+03:00"></relative-time>
+        </div>
+        """
+        state = {
+            "state": {
+                "run": {
+                    "status": "waiting",
+                    "title": "Follow official Xray dev releases",
+                    "commit": {"branch": {"name": "main"}},
+                }
+            }
+        }
+        detail = (
+            '<div data-initial-post-response="'
+            + __import__("html").escape(json.dumps(state), quote=True)
+            + '"></div>'
+        )
+        with mock.patch.object(
+            release_alert_monitor,
+            "fetch_text",
+            side_effect=(listing, detail),
+        ):
+            runs = release_alert_monitor.fetch_actions_html(
+                "https://git.zapret.moe/api/v1/repos/"
+                "zapretkvn/vpnbot-xray-patches/actions/runs",
+                "candidate.yml",
+                20,
+            )
+
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0]["id"], 25)
+        self.assertEqual(runs[0]["status"], "waiting")
+        self.assertEqual(runs[0]["prettyref"], "main")
+
+    def test_release_alert_escalates_a_stalled_pending_workflow(self) -> None:
+        condition = release_alert_monitor.evaluate_patch_pipeline(
+            [
+                {
+                    "id": 25,
+                    "workflow_id": "candidate.yml",
+                    "prettyref": "main",
+                    "status": "waiting",
+                    "title": "scheduled",
+                    "created_at": "2026-08-09T06:00:00Z",
+                    "html_url": "https://forgejo.invalid/actions/runs/25",
+                }
+            ],
+            "candidate.yml",
+            now_epoch=int(
+                __import__("datetime").datetime(
+                    2026,
+                    8,
+                    9,
+                    9,
+                    0,
+                    tzinfo=__import__("datetime").timezone.utc,
+                ).timestamp()
+            ),
+            stall_seconds=7200,
+        )
+
+        self.assertEqual(condition.status, "problem")
+        self.assertEqual(condition.signature, "run:25:stalled:waiting")
+        self.assertIn("runner", condition.action)
+
     def test_candidate_stall_is_bound_to_publication_time(self) -> None:
         candidate = release_alert_monitor.Candidate(
             tag="v26.8.1-vpnbot.1-candidate.1",

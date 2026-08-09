@@ -8,6 +8,7 @@ import contextlib
 import dataclasses
 import datetime as dt
 import fcntl
+import html
 import json
 import os
 import re
@@ -16,6 +17,7 @@ import stat
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any, Callable
@@ -107,12 +109,12 @@ def load_settings() -> Settings:
         actions_url=env(
             "VPNBOT_XRAY_ALERT_ACTIONS_URL",
             "https://git.zapret.moe/api/v1/repos/"
-            "zapretdiscordyoutube/vpnbot-xray-patches/actions/runs",
+            "zapretkvn/vpnbot-xray-patches/actions/runs",
         ),
         releases_url=env(
             "VPNBOT_XRAY_ALERT_RELEASES_URL",
             "https://git.zapret.moe/api/v1/repos/"
-            "zapretdiscordyoutube/vpnbot-xray-patches/releases",
+            "zapretkvn/vpnbot-xray-patches/releases",
         ),
         workflow_id=env("VPNBOT_XRAY_ALERT_WORKFLOW_ID", "candidate.yml"),
         bot_env_file=Path(
@@ -255,7 +257,135 @@ def load_bot_token(path: Path) -> str:
     return token
 
 
-def fetch_actions(url: str, timeout: int) -> list[dict[str, Any]]:
+def fetch_text(url: str, timeout: int) -> str:
+    request = urllib.request.Request(
+        url,
+        headers={"Accept": "text/html", "User-Agent": "vpnbot-xray-release-alert/1"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read(2 * 1024 * 1024 + 1)
+    except urllib.error.HTTPError as exc:
+        raise release_pipeline.PipelineError(
+            f"Forgejo Actions page returned HTTP {exc.code}"
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise release_pipeline.PipelineError(
+            f"Forgejo Actions page request failed: {exc.reason}"
+        ) from exc
+    if len(raw) > 2 * 1024 * 1024:
+        raise release_pipeline.PipelineError("Forgejo Actions page is too large")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise release_pipeline.PipelineError(
+            "Forgejo Actions page is not UTF-8"
+        ) from exc
+
+
+def actions_web_url(actions_api_url: str, workflow_id: str) -> str:
+    match = re.fullmatch(
+        r"(https://[^/]+)/api/v1/repos/([^/]+)/([^/]+)/actions/runs(?:\?.*)?",
+        actions_api_url,
+    )
+    if not match:
+        raise release_pipeline.PipelineError(
+            "Forgejo Actions API URL cannot be mapped to its public workflow page"
+        )
+    origin, owner, repository = match.groups()
+    query = urllib.parse.urlencode({"workflow": workflow_id})
+    return f"{origin}/{owner}/{repository}/actions?{query}"
+
+
+def fetch_actions_html(
+    actions_api_url: str,
+    workflow_id: str,
+    timeout: int,
+) -> list[dict[str, Any]]:
+    """Read the newest public run when Forgejo's Actions API returns zero rows.
+
+    Forgejo 16 currently renders public runs while its unauthenticated
+    ``actions/runs`` API can return an empty list.  The run detail page embeds
+    one escaped, structured JSON state object; parsing that object is safer
+    than inferring outcome from localized icons or text.
+    """
+
+    web_url = actions_web_url(actions_api_url, workflow_id)
+    listing = fetch_text(web_url, timeout)
+    items = re.findall(
+        r'<div class="flex-item tw-items-center">(.*?)(?=<div class="flex-item tw-items-center">|\Z)',
+        listing,
+        flags=re.DOTALL,
+    )
+    candidates: list[tuple[int, str, str]] = []
+    for item in items:
+        link_match = re.search(r'href="([^"]+/actions/runs/([1-9][0-9]*))"', item)
+        run_number_match = re.search(r"<b>\s*#([1-9][0-9]*)\s*</b>", item)
+        branch_match = re.search(
+            r'class="ui label run-list-ref[^>]*data-tooltip-content="([^"]+)"',
+            item,
+        )
+        timestamp_match = re.search(
+            r'<relative-time[^>]+datetime="([^"]+)"',
+            item,
+        )
+        if (
+            link_match is None
+            or run_number_match is None
+            or branch_match is None
+            or timestamp_match is None
+            or run_number_match.group(1) != link_match.group(2)
+            or branch_match.group(1) != "main"
+        ):
+            continue
+        candidates.append(
+            (int(run_number_match.group(1)), link_match.group(1), timestamp_match.group(1))
+        )
+    if not candidates:
+        return []
+    run_id, relative_link, created_at = max(candidates)
+    detail_url = urllib.parse.urljoin(web_url, relative_link)
+    detail = fetch_text(detail_url, timeout)
+    state_match = re.search(
+        r'data-initial-post-response="([^"]+)"',
+        detail,
+    )
+    if state_match is None:
+        raise release_pipeline.PipelineError(
+            f"Forgejo Actions run {run_id} has no structured state"
+        )
+    try:
+        payload = json.loads(html.unescape(state_match.group(1)))
+        run = payload["state"]["run"]
+        status = str(run["status"]).strip().lower()
+        branch = str(run["commit"]["branch"]["name"]).strip()
+        title = str(run["title"]).strip()
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise release_pipeline.PipelineError(
+            f"Forgejo Actions run {run_id} has invalid structured state"
+        ) from exc
+    if branch != "main" or not status:
+        raise release_pipeline.PipelineError(
+            f"Forgejo Actions run {run_id} has an invalid branch or status"
+        )
+    return [
+        {
+            "id": run_id,
+            "workflow_id": workflow_id,
+            "prettyref": branch,
+            "status": status,
+            "title": title,
+            "html_url": detail_url,
+            "created_at": created_at,
+        }
+    ]
+
+
+def fetch_actions(
+    url: str,
+    timeout: int,
+    workflow_id: str = "",
+) -> list[dict[str, Any]]:
     separator = "&" if "?" in url else "?"
     payload = release_pipeline.request_json(f"{url}{separator}limit=50", timeout=timeout)
     if not isinstance(payload, dict):
@@ -263,10 +393,18 @@ def fetch_actions(url: str, timeout: int) -> list[dict[str, Any]]:
     runs = payload.get("workflow_runs")
     if not isinstance(runs, list) or not all(isinstance(item, dict) for item in runs):
         raise release_pipeline.PipelineError("Forgejo Actions API returned an invalid run list")
-    return runs
+    if runs or not workflow_id:
+        return runs
+    return fetch_actions_html(url, workflow_id, timeout)
 
 
-def evaluate_patch_pipeline(runs: list[dict[str, Any]], workflow_id: str) -> Condition:
+def evaluate_patch_pipeline(
+    runs: list[dict[str, Any]],
+    workflow_id: str,
+    *,
+    now_epoch: int | None = None,
+    stall_seconds: int = 7200,
+) -> Condition:
     relevant = [
         run
         for run in runs
@@ -286,6 +424,29 @@ def evaluate_patch_pipeline(runs: list[dict[str, Any]], workflow_id: str) -> Con
     if status == "success":
         return Condition(name="patch_pipeline", status="healthy")
     if status in PENDING_WORKFLOW_STATES:
+        created_at = latest.get("created_at")
+        if created_at and now_epoch is not None:
+            created_epoch = parse_timestamp(
+                created_at,
+                f"Forgejo Actions run {run_id} creation time",
+            )
+            if now_epoch - created_epoch >= stall_seconds:
+                age_minutes = max(0, (now_epoch - created_epoch) // 60)
+                return Condition(
+                    name="patch_pipeline",
+                    status="problem",
+                    signature=f"run:{run_id}:stalled:{status}",
+                    headline="Forgejo Actions не начал или не завершил выпуск Xray",
+                    detail=(
+                        f"Workflow {workflow_id}, запуск {run_id}, состояние: {status}, "
+                        f"возраст: {age_minutes} мин. Candidate безопасно не выпускается."
+                    ),
+                    action=(
+                        "Проверь регистрацию и online-состояние Forgejo runner, его "
+                        "метку linux и журнал конкретного запуска. Не публикуй proven вручную."
+                    ),
+                    url=link,
+                )
         return Condition(name="patch_pipeline", status="pending")
     if status not in FAILED_WORKFLOW_STATES:
         raise release_pipeline.PipelineError(
@@ -473,12 +634,21 @@ def evaluate_canary(
 
 
 def collect_conditions(settings: Settings, now_epoch: int) -> list[Condition]:
-    runs = fetch_actions(settings.actions_url, settings.request_timeout_seconds)
+    runs = fetch_actions(
+        settings.actions_url,
+        settings.request_timeout_seconds,
+        settings.workflow_id,
+    )
     releases = release_pipeline.list_forgejo_releases(settings.releases_url)
     candidates = unproven_candidates(releases)
     states = load_promoter_states(settings.promoter_state_dir)
     return [
-        evaluate_patch_pipeline(runs, settings.workflow_id),
+        evaluate_patch_pipeline(
+            runs,
+            settings.workflow_id,
+            now_epoch=now_epoch,
+            stall_seconds=settings.stall_seconds,
+        ),
         evaluate_candidate_stall(candidates, now_epoch, settings.stall_seconds),
         evaluate_canary(candidates, states),
     ]
