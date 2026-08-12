@@ -114,6 +114,83 @@ class ReleasePipelineTests(unittest.TestCase):
                 )
         urlopen.assert_called_once()
 
+    def test_create_release_ignores_mutation_response_assets_and_refetches_exact_tag(self) -> None:
+        tag = "v26.7.28-vpnbot.9-candidate.1"
+        target = "a" * 40
+        mutation_response = {
+            "id": 77,
+            "tag_name": tag,
+            "assets": [
+                {"name": "unrelated.jpg"},
+                {"name": "unrelated.jpg"},
+            ],
+        }
+        canonical = {
+            "id": 77,
+            "tag_name": tag,
+            "target_commitish": target,
+            "draft": True,
+            "prerelease": True,
+            "assets": [],
+        }
+        with (
+            mock.patch.object(
+                release_pipeline,
+                "request_json",
+                return_value=mutation_response,
+            ),
+            mock.patch.object(
+                release_pipeline,
+                "release_by_tag",
+                return_value=canonical,
+            ) as by_tag,
+        ):
+            created = release_pipeline.create_release(
+                "https://forgejo.invalid/releases",
+                token="secret",
+                tag=tag,
+                target=target,
+                prerelease=True,
+                title="candidate",
+                body="body",
+            )
+        self.assertIs(created, canonical)
+        by_tag.assert_called_once_with(
+            "https://forgejo.invalid/releases",
+            tag,
+            token="secret",
+        )
+
+    def test_create_release_rejects_refetched_identity_mismatch(self) -> None:
+        with (
+            mock.patch.object(
+                release_pipeline,
+                "request_json",
+                return_value={"id": 77},
+            ),
+            mock.patch.object(
+                release_pipeline,
+                "release_by_tag",
+                return_value={
+                    "id": 78,
+                    "tag_name": "v26.7.28-vpnbot.9-candidate.1",
+                    "target_commitish": "a" * 40,
+                    "draft": True,
+                    "prerelease": True,
+                },
+            ),
+        ):
+            with self.assertRaisesRegex(release_pipeline.PipelineError, "changed after creation"):
+                release_pipeline.create_release(
+                    "https://forgejo.invalid/releases",
+                    token="secret",
+                    tag="v26.7.28-vpnbot.9-candidate.1",
+                    target="a" * 40,
+                    prerelease=True,
+                    title="candidate",
+                    body="body",
+                )
+
     def test_latest_official_release_uses_only_safe_atom_link(self) -> None:
         feed = b"""<?xml version='1.0' encoding='UTF-8'?>
 <feed xmlns='http://www.w3.org/2005/Atom'>

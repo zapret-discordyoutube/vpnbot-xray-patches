@@ -697,7 +697,18 @@ def create_release(
     )
     if not isinstance(payload, dict) or not isinstance(payload.get("id"), int):
         raise PipelineError(f"Forgejo did not create release {tag}")
-    return payload
+    created_id = int(payload["id"])
+    refreshed = release_by_tag(releases_url, tag, token=token)
+    if (
+        refreshed is None
+        or int(refreshed.get("id") or 0) != created_id
+        or str(refreshed.get("tag_name") or "") != tag
+        or str(refreshed.get("target_commitish") or "") != target
+        or bool(refreshed.get("draft")) != draft
+        or bool(refreshed.get("prerelease")) != prerelease
+    ):
+        raise PipelineError(f"Forgejo release {tag} changed after creation")
+    return refreshed
 
 
 def publish_release(
@@ -713,13 +724,18 @@ def publish_release(
         method="PATCH",
         payload={"draft": False, "prerelease": prerelease},
     )
-    if (
-        not isinstance(payload, dict)
-        or payload.get("draft")
-        or bool(payload.get("prerelease")) != prerelease
-    ):
+    if not isinstance(payload, dict) or not isinstance(payload.get("id"), int):
         raise PipelineError(f"Forgejo did not publish release {release.get('tag_name')}")
-    return payload
+    tag = str(release.get("tag_name") or "")
+    refreshed = release_by_tag(releases_url, tag, token=token)
+    if (
+        refreshed is None
+        or int(refreshed.get("id") or 0) != int(release["id"])
+        or refreshed.get("draft")
+        or bool(refreshed.get("prerelease")) != prerelease
+    ):
+        raise PipelineError(f"Forgejo did not publish release {tag}")
+    return refreshed
 
 
 def multipart_attachment(name: str, payload: bytes) -> tuple[bytes, str]:
@@ -825,6 +841,7 @@ def publish_candidate(args: argparse.Namespace) -> int:
             token=token,
             prerelease=True,
         )
+    ensure_release_assets(args.forgejo_releases_url, release, expected, token=token)
     if release.get("draft") or not release.get("prerelease"):
         raise PipelineError(f"candidate tag {tag} was not published as a prerelease")
     print(f"candidate release is complete: {tag}")
