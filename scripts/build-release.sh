@@ -74,13 +74,18 @@ for asset in geoip geosite; do
 done
 
 build_target() {
-    local archive_name="$1" goarch="$2" goarm="$3"
+    local archive_name="$1" goarch="$2" goarm="$3" goamd64="$4"
     local package_directory="${TEMP_DIRECTORY}/${archive_name%.zip}"
+    local -a go_environment=(CGO_ENABLED=0 GOOS=linux "GOARCH=${goarch}" "GOARM=${goarm}")
+    if [[ "$goarch" == amd64 ]]; then
+        [[ "$goamd64" =~ ^v[1-4]$ ]] || fail "invalid GOAMD64 profile: $goamd64"
+        go_environment+=("GOAMD64=${goamd64}")
+    fi
     mkdir -p -- "$package_directory"
 
     (
         cd "$SOURCE_DIRECTORY"
-        CGO_ENABLED=0 GOOS=linux GOARCH="$goarch" GOARM="$goarm" \
+        env "${go_environment[@]}" \
             go build -o "${package_directory}/xray" \
             -trimpath -buildvcs=false -gcflags="all=-l=4" \
             -ldflags="-X github.com/xtls/xray-core/core.build=${VPNBOT_RELEASE_TAG} -s -w -buildid=" \
@@ -113,6 +118,7 @@ build_target() {
     sha256sum "${OUTPUT_DIRECTORY}/${archive_name}"
 }
 
-build_target Xray-linux-64.zip amd64 ""
-build_target Xray-linux-arm64-v8a.zip arm64 ""
-build_target Xray-linux-arm32-v7a.zip arm 7
+build_target Xray-linux-64.zip amd64 "" v1
+build_target Xray-linux-64-v3.zip amd64 "" v3
+build_target Xray-linux-arm64-v8a.zip arm64 "" ""
+build_target Xray-linux-arm32-v7a.zip arm 7 ""

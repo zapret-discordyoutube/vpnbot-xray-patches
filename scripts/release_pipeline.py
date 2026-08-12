@@ -22,8 +22,9 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 CAPABILITY = "vpnbot-active-revoke-v3"
+BUILD_PROFILE = "linux-cpu-profiles-v2"
 OFFICIAL_REPOSITORY = "https://github.com/XTLS/Xray-core.git"
 OFFICIAL_RELEASES_FEED = "https://github.com/XTLS/Xray-core/releases.atom"
 OFFICIAL_RELEASE_TAG_PATH = "/XTLS/Xray-core/releases/tag/"
@@ -38,6 +39,52 @@ CANDIDATE_RE = re.compile(
 SAFE_ENV_RE = re.compile(r"^[A-Za-z0-9_./:@+-]+$")
 HEX40_RE = re.compile(r"^[0-9a-f]{40}$")
 HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+
+GOAMD64_V3_LINUX_FLAGS = (
+    "abm",
+    "avx",
+    "avx2",
+    "bmi1",
+    "bmi2",
+    "cx16",
+    "f16c",
+    "fma",
+    "lahf_lm",
+    "movbe",
+    "pni",
+    "popcnt",
+    "sse4_1",
+    "sse4_2",
+    "ssse3",
+    "xsave",
+)
+
+ARTIFACT_PROFILES: dict[str, dict[str, Any]] = {
+    "Xray-linux-64.zip": {
+        "goarch": "amd64",
+        "goamd64": "v1",
+        "cpu_profile": "baseline",
+        "required_linux_cpu_flags": [],
+    },
+    "Xray-linux-64-v3.zip": {
+        "goarch": "amd64",
+        "goamd64": "v3",
+        "cpu_profile": "v3",
+        "required_linux_cpu_flags": list(GOAMD64_V3_LINUX_FLAGS),
+    },
+    "Xray-linux-arm64-v8a.zip": {
+        "goarch": "arm64",
+        "goamd64": "",
+        "cpu_profile": "native",
+        "required_linux_cpu_flags": [],
+    },
+    "Xray-linux-arm32-v7a.zip": {
+        "goarch": "arm",
+        "goamd64": "",
+        "cpu_profile": "native",
+        "required_linux_cpu_flags": [],
+    },
+}
 
 
 class PipelineError(RuntimeError):
@@ -297,6 +344,7 @@ def same_source_and_patches(manifest: dict[str, Any], commit: str, patchset: str
         manifest.get("upstream", {}).get("commit") == commit
         and manifest.get("patches", {}).get("set_sha256") == patchset
         and manifest.get("capability") == CAPABILITY
+        and manifest.get("build_profile") == BUILD_PROFILE
     )
 
 
@@ -453,6 +501,8 @@ def manifest_command(args: argparse.Namespace) -> int:
     expected_names = {
         "Xray-linux-64.zip",
         "Xray-linux-64.zip.dgst",
+        "Xray-linux-64-v3.zip",
+        "Xray-linux-64-v3.zip.dgst",
         "Xray-linux-arm64-v8a.zip",
         "Xray-linux-arm64-v8a.zip.dgst",
         "Xray-linux-arm32-v7a.zip",
@@ -463,15 +513,21 @@ def manifest_command(args: argparse.Namespace) -> int:
         raise PipelineError(
             f"release asset set mismatch: expected={sorted(expected_names)} actual={sorted(actual_files)}"
         )
-    assets = {
-        name: {"sha256": sha256_file(path), "size": path.stat().st_size}
-        for name, path in sorted(actual_files.items())
-    }
+    assets = {}
+    for name, path in sorted(actual_files.items()):
+        metadata: dict[str, Any] = {
+            "sha256": sha256_file(path),
+            "size": path.stat().st_size,
+        }
+        if name in ARTIFACT_PROFILES:
+            metadata.update(ARTIFACT_PROFILES[name])
+        assets[name] = metadata
     epoch = int(values["SOURCE_DATE_EPOCH"])
     commit_time = dt.datetime.fromtimestamp(epoch, tz=dt.timezone.utc).isoformat().replace("+00:00", "Z")
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "capability": CAPABILITY,
+        "build_profile": BUILD_PROFILE,
         "upstream": {
             "repository": values["XRAY_UPSTREAM_REPOSITORY"],
             "tag": values["XRAY_UPSTREAM_TAG"],
@@ -496,10 +552,13 @@ def manifest_command(args: argparse.Namespace) -> int:
 
 
 def validate_manifest(manifest: Any) -> None:
-    if not isinstance(manifest, dict) or manifest.get("schema_version") != SCHEMA_VERSION:
+    if not isinstance(manifest, dict) or manifest.get("schema_version") not in {1, SCHEMA_VERSION}:
         raise PipelineError("unsupported release manifest schema")
+    schema_version = int(manifest["schema_version"])
     if manifest.get("capability") != CAPABILITY:
         raise PipelineError("release manifest capability mismatch")
+    if schema_version == SCHEMA_VERSION and manifest.get("build_profile") != BUILD_PROFILE:
+        raise PipelineError("release manifest build profile mismatch")
     upstream = manifest.get("upstream")
     release = manifest.get("release")
     patches = manifest.get("patches")
@@ -535,8 +594,23 @@ def validate_manifest(manifest: Any) -> None:
         raise PipelineError("candidate tag does not belong to proven tag")
     if not isinstance(assets, dict) or not assets:
         raise PipelineError("release manifest contains no assets")
+    if schema_version == 1:
+        expected_asset_names = {
+            "Xray-linux-64.zip",
+            "Xray-linux-64.zip.dgst",
+            "Xray-linux-arm64-v8a.zip",
+            "Xray-linux-arm64-v8a.zip.dgst",
+            "Xray-linux-arm32-v7a.zip",
+            "Xray-linux-arm32-v7a.zip.dgst",
+        }
+    else:
+        expected_asset_names = set(ARTIFACT_PROFILES) | {
+            f"{name}.dgst" for name in ARTIFACT_PROFILES
+        }
+    if set(assets) != expected_asset_names:
+        raise PipelineError("release manifest asset set does not match build profile")
     for name, item in assets.items():
-        if not re.fullmatch(r"Xray-linux-(?:64|arm64-v8a|arm32-v7a)\.zip(?:\.dgst)?", str(name)):
+        if name not in expected_asset_names:
             raise PipelineError(f"release manifest contains unexpected asset: {name}")
         if (
             not isinstance(item, dict)
@@ -545,6 +619,21 @@ def validate_manifest(manifest: Any) -> None:
             or item["size"] <= 0
         ):
             raise PipelineError(f"release manifest asset metadata is invalid: {name}")
+        if schema_version == SCHEMA_VERSION and name in ARTIFACT_PROFILES:
+            expected_profile = ARTIFACT_PROFILES[name]
+            actual_profile = {
+                key: item.get(key)
+                for key in (
+                    "goarch",
+                    "goamd64",
+                    "cpu_profile",
+                    "required_linux_cpu_flags",
+                )
+            }
+            if actual_profile != expected_profile:
+                raise PipelineError(
+                    f"release manifest CPU profile is invalid: {name}"
+                )
 
 
 def token_from_environment() -> str:

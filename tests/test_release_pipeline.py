@@ -141,9 +141,18 @@ class ReleasePipelineTests(unittest.TestCase):
                 release_pipeline.official_git_metadata("v26.7.28")
 
     def test_manifest_rejects_candidate_that_does_not_belong_to_proven(self) -> None:
+        assets = {}
+        for name, profile in release_pipeline.ARTIFACT_PROFILES.items():
+            assets[name] = {
+                "sha256": "d" * 64,
+                "size": 1,
+                **profile,
+            }
+            assets[f"{name}.dgst"] = {"sha256": "e" * 64, "size": 1}
         manifest = {
-            "schema_version": 1,
+            "schema_version": release_pipeline.SCHEMA_VERSION,
             "capability": release_pipeline.CAPABILITY,
+            "build_profile": release_pipeline.BUILD_PROFILE,
             "upstream": {
                 "repository": release_pipeline.OFFICIAL_REPOSITORY,
                 "tag": "v26.7.28",
@@ -164,12 +173,77 @@ class ReleasePipelineTests(unittest.TestCase):
                 "proven_tag": "v26.7.28-vpnbot.7",
             },
             "toolchain": {"go_version": "1.26"},
-            "assets": {
-                "Xray-linux-64.zip": {"sha256": "d" * 64, "size": 1},
-            },
+            "assets": assets,
         }
         with self.assertRaisesRegex(release_pipeline.PipelineError, "does not belong"):
             release_pipeline.validate_manifest(manifest)
+
+    def test_build_profile_change_forces_a_new_release_edition(self) -> None:
+        manifest = {
+            "upstream": {"commit": "a" * 40},
+            "patches": {"set_sha256": "b" * 64},
+            "capability": release_pipeline.CAPABILITY,
+            "build_profile": "legacy-single-amd64",
+        }
+
+        self.assertFalse(
+            release_pipeline.same_source_and_patches(
+                manifest,
+                "a" * 40,
+                "b" * 64,
+            )
+        )
+
+    def test_legacy_manifest_remains_readable_but_cannot_match_new_profile(self) -> None:
+        assets = {}
+        for name in (
+            "Xray-linux-64.zip",
+            "Xray-linux-arm64-v8a.zip",
+            "Xray-linux-arm32-v7a.zip",
+        ):
+            assets[name] = {"sha256": "d" * 64, "size": 1}
+            assets[f"{name}.dgst"] = {"sha256": "e" * 64, "size": 1}
+        manifest = {
+            "schema_version": 1,
+            "capability": release_pipeline.CAPABILITY,
+            "upstream": {
+                "repository": release_pipeline.OFFICIAL_REPOSITORY,
+                "tag": "v26.7.28",
+                "commit": "a" * 40,
+                "commit_time": "2026-07-28T00:00:00Z",
+                "source_date_epoch": 1785196800,
+            },
+            "patch_repository": {"commit": "b" * 40},
+            "patches": {
+                "set_sha256": "c" * 64,
+                "items": [
+                    {"name": f"000{index}-patch.patch", "sha256": str(index) * 64}
+                    for index in range(1, 4)
+                ],
+            },
+            "release": {
+                "candidate_tag": "v26.7.28-vpnbot.4-candidate.1",
+                "proven_tag": "v26.7.28-vpnbot.4",
+            },
+            "toolchain": {"go_version": "1.26.4"},
+            "assets": assets,
+        }
+
+        release_pipeline.validate_manifest(manifest)
+        self.assertFalse(
+            release_pipeline.same_source_and_patches(
+                manifest, "a" * 40, "c" * 64
+            )
+        )
+
+    def test_build_script_produces_baseline_and_goamd64_v3(self) -> None:
+        source = (ROOT / "scripts" / "build-release.sh").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("build_target Xray-linux-64.zip amd64 \"\" v1", source)
+        self.assertIn("build_target Xray-linux-64-v3.zip amd64 \"\" v3", source)
+        self.assertIn('go_environment+=("GOAMD64=${goamd64}")', source)
 
     def test_proof_is_bound_to_the_exact_manifest(self) -> None:
         manifest_bytes = b'{"schema_version":1}\n'

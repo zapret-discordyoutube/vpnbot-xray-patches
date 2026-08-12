@@ -176,17 +176,24 @@ def updater(settings: Settings, tag: str, channel: str) -> str:
         or release_pipeline.PROVEN_RE.fullmatch(tag)
     ):
         raise release_pipeline.PipelineError(f"unsafe updater target tag: {tag}")
+    cpu_profile = "v3" if channel == "candidate" else "auto"
     result = remote_command(
         settings,
         [
             "/usr/bin/env",
             f"XRAY_CORE_RELEASE_CHANNEL={channel}",
             f"XRAY_CORE_VERSION={tag}",
+            f"XRAY_CORE_CPU_PROFILE={cpu_profile}",
             settings.updater_path,
             "--force",
         ],
     )
-    return require_remote_success(result, f"installing {tag} on canary")
+    output = require_remote_success(result, f"installing {tag} on canary")
+    if channel == "candidate" and "cpu_profile=v3" not in output:
+        raise release_pipeline.PipelineError(
+            "candidate updater did not prove the required GOAMD64 v3 artifact"
+        )
+    return output
 
 
 def write_state(path: Path, payload: dict[str, Any]) -> None:

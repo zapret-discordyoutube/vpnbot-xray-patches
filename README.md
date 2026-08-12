@@ -54,6 +54,11 @@ Xray-core для discovery не используются. Официальный
 Каждый candidate содержит `vpnbot-xray-release-manifest.json` с официальным
 тегом/commit, SHA-256 патчей и архивов. Proven дополнительно содержит
 `vpnbot-xray-pilot-proof.json`, то есть машинно проверяемый отчёт живого пилота.
+Для Linux amd64 один выпуск содержит два архива из одного и того же исходника:
+совместимый `Xray-linux-64.zip` (`GOAMD64=v1`) и оптимизированный
+`Xray-linux-64-v3.zip` (`GOAMD64=v3`). Манифест схемы 2 закрепляет требования
+к процессору, узловой updater выбирает вариант по фактически видимым гостевой
+системе CPU flags, а production-canary обязан доказать именно v3-вариант.
 Полная модель состояний, гонок и rollback описана в
 [`docs/2026-08-07-automatic-dev-release-plan.md`](docs/2026-08-07-automatic-dev-release-plan.md).
 
