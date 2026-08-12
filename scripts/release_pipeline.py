@@ -32,7 +32,7 @@ OFFICIAL_RELEASES_FEED = "https://github.com/XTLS/Xray-core/releases.atom"
 OFFICIAL_RELEASE_TAG_PATH = "/XTLS/Xray-core/releases/tag/"
 HTTP_USER_AGENT = (
     "vpnbot-xray-release-pipeline/1 "
-    "(+https://git.zapret.moe/zapretdiscordyoutube/vpnbot-xray-patches)"
+    "(+https://git.zapret.moe/zapretkvn/vpnbot-xray-patches)"
 )
 ATOM_NAMESPACE = "http://www.w3.org/2005/Atom"
 MANIFEST_NAME = "vpnbot-xray-release-manifest.json"
