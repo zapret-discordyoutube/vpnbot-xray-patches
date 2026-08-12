@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import hashlib
+import http.client
 import json
 import mimetypes
 import os
@@ -13,6 +14,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -28,6 +30,10 @@ BUILD_PROFILE = "linux-cpu-profiles-v2"
 OFFICIAL_REPOSITORY = "https://github.com/XTLS/Xray-core.git"
 OFFICIAL_RELEASES_FEED = "https://github.com/XTLS/Xray-core/releases.atom"
 OFFICIAL_RELEASE_TAG_PATH = "/XTLS/Xray-core/releases/tag/"
+HTTP_USER_AGENT = (
+    "vpnbot-xray-release-pipeline/1 "
+    "(+https://git.zapret.moe/zapretdiscordyoutube/vpnbot-xray-patches)"
+)
 ATOM_NAMESPACE = "http://www.w3.org/2005/Atom"
 MANIFEST_NAME = "vpnbot-xray-release-manifest.json"
 PROOF_NAME = "vpnbot-xray-pilot-proof.json"
@@ -130,21 +136,27 @@ def request_bytes(
 ) -> bytes:
     headers = {
         "Accept": accept,
-        "User-Agent": "vpnbot-xray-release-pipeline/1",
+        "User-Agent": HTTP_USER_AGENT,
     }
     if token:
         headers["Authorization"] = f"token {token}"
     if payload is not None:
         headers["Content-Type"] = content_type
-    request = urllib.request.Request(url, data=payload, headers=headers, method=method)
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            return response.read()
-    except urllib.error.HTTPError as exc:
-        detail = exc.read(4096).decode("utf-8", errors="replace")
-        raise PipelineError(f"HTTP {exc.code} for {url}: {detail}") from exc
-    except urllib.error.URLError as exc:
-        raise PipelineError(f"request failed for {url}: {exc.reason}") from exc
+    attempts = 3 if method == "GET" and payload is None else 1
+    for attempt in range(1, attempts + 1):
+        request = urllib.request.Request(url, data=payload, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return response.read()
+        except urllib.error.HTTPError as exc:
+            detail = exc.read(4096).decode("utf-8", errors="replace")
+            raise PipelineError(f"HTTP {exc.code} for {url}: {detail}") from exc
+        except (urllib.error.URLError, http.client.RemoteDisconnected, TimeoutError) as exc:
+            if attempt == attempts:
+                reason = exc.reason if isinstance(exc, urllib.error.URLError) else str(exc)
+                raise PipelineError(f"request failed for {url}: {reason}") from exc
+            time.sleep(0.5 * attempt)
+    raise AssertionError("unreachable request retry state")
 
 
 def request_json(

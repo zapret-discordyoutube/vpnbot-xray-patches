@@ -57,6 +57,63 @@ class ReleasePipelineTests(unittest.TestCase):
         self.assertEqual(len(rows), 3)
         self.assertRegex(release_pipeline.patchset_sha256(rows), r"^[0-9a-f]{64}$")
 
+    def test_http_requests_identify_the_release_robot_with_project_contact(self) -> None:
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b"ok"
+        response.__exit__.return_value = False
+
+        with mock.patch.object(
+            release_pipeline.urllib.request,
+            "urlopen",
+            return_value=response,
+        ) as urlopen:
+            self.assertEqual(
+                release_pipeline.request_bytes("https://example.invalid/release"),
+                b"ok",
+            )
+
+        request = urlopen.call_args.args[0]
+        self.assertEqual(
+            request.get_header("User-agent"),
+            release_pipeline.HTTP_USER_AGENT,
+        )
+        self.assertIn("https://git.zapret.moe/", release_pipeline.HTTP_USER_AGENT)
+
+    def test_read_request_retries_remote_disconnect_but_write_does_not(self) -> None:
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b"feed"
+        response.__exit__.return_value = False
+        with (
+            mock.patch.object(
+                release_pipeline.urllib.request,
+                "urlopen",
+                side_effect=[
+                    release_pipeline.http.client.RemoteDisconnected(),
+                    response,
+                ],
+            ) as urlopen,
+            mock.patch.object(release_pipeline.time, "sleep") as sleep,
+        ):
+            self.assertEqual(
+                release_pipeline.request_bytes("https://example.invalid/feed"),
+                b"feed",
+            )
+        self.assertEqual(urlopen.call_count, 2)
+        sleep.assert_called_once_with(0.5)
+
+        with mock.patch.object(
+            release_pipeline.urllib.request,
+            "urlopen",
+            side_effect=release_pipeline.http.client.RemoteDisconnected(),
+        ) as urlopen:
+            with self.assertRaisesRegex(release_pipeline.PipelineError, "request failed"):
+                release_pipeline.request_bytes(
+                    "https://example.invalid/release",
+                    method="POST",
+                    payload=b"{}",
+                )
+        urlopen.assert_called_once()
+
     def test_latest_official_release_uses_only_safe_atom_link(self) -> None:
         feed = b"""<?xml version='1.0' encoding='UTF-8'?>
 <feed xmlns='http://www.w3.org/2005/Atom'>
