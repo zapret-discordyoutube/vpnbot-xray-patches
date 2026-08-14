@@ -1,3 +1,3 @@
 cff026a11a5684c1c1a82d24c822106533e79996ec6044c399d96bb271f7f677  0001-Interrupt-active-VLESS-sessions-on-user-removal.patch
 9da5d7b2209c7f62023b23c69501afcc362805b4c41d9e3f966a9f3e72ace30f  0002-Interrupt-active-Trojan-sessions-on-user-removal.patch
-c4a80b4b25780f88e89c335246220108f165c7f9ee33cac330a32034da00cad6  0003-Interrupt-all-managed-Xray-user-sessions.patch
+840c2e6db1caf3ddf4561e7f2e312def4a436e0338a08710d2a14abdd08facb3  0003-Interrupt-all-managed-Xray-user-sessions.patch

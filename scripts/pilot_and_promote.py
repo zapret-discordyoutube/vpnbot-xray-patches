@@ -295,6 +295,8 @@ def run_canary(settings: Settings, expected_proven_tag: str) -> dict[str, Any]:
             expected_proven_tag,
             "--capability",
             release_pipeline.CAPABILITY,
+            "--live-audit-capability",
+            release_pipeline.LIVE_USER_AUDIT_CAPABILITY,
             "--cutoff-seconds",
             "10",
         ],

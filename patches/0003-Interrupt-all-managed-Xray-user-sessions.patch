@@ -1,23 +1,28 @@
-From 0d9b32c4884df93996aa708be40787c186b8b41b Mon Sep 17 00:00:00 2001
+From 2bfd87746121ebc23c7f0af88802cbc2bcb22c5f Mon Sep 17 00:00:00 2001
 From: loop-uh <loop-uh@users.noreply.github.com>
 Date: Thu, 6 Aug 2026 01:49:25 +0300
-Subject: [PATCH 3/3] Interrupt all managed Xray user sessions
+Subject: [PATCH] Interrupt all managed Xray user sessions
 
 ---
- VPNBOT_ACTIVE_REVOKE.md                       |  31 +-
- core/core.go                                  |   1 +
+ VPNBOT_ACTIVE_REVOKE.md                       |  44 ++-
+ core/core.go                                  |   2 +
+ main/commands/all/api/api.go                  |   1 +
+ .../all/api/vpnbot_live_user_audit.go         | 161 ++++++++
+ .../all/api/vpnbot_live_user_audit_test.go    | 123 ++++++
  proxy/shadowsocks/active_sessions_test.go     |  71 ++++
  proxy/shadowsocks/server.go                   |  58 ++-
  proxy/vmess/inbound/active_sessions_test.go   |  80 ++++
  proxy/vmess/inbound/inbound.go                |  58 ++-
  .../managed_user_active_revoke_test.go        | 350 ++++++++++++++++++
- 7 files changed, 617 insertions(+), 32 deletions(-)
+ 10 files changed, 916 insertions(+), 32 deletions(-)
+ create mode 100644 main/commands/all/api/vpnbot_live_user_audit.go
+ create mode 100644 main/commands/all/api/vpnbot_live_user_audit_test.go
  create mode 100644 proxy/shadowsocks/active_sessions_test.go
  create mode 100644 proxy/vmess/inbound/active_sessions_test.go
  create mode 100644 testing/scenarios/managed_user_active_revoke_test.go
 
 diff --git a/VPNBOT_ACTIVE_REVOKE.md b/VPNBOT_ACTIVE_REVOKE.md
-index d6b4c594..2e760f3d 100644
+index d6b4c59..affa290 100644
 --- a/VPNBOT_ACTIVE_REVOKE.md
 +++ b/VPNBOT_ACTIVE_REVOKE.md
 @@ -1,23 +1,24 @@
@@ -55,7 +60,7 @@ index d6b4c594..2e760f3d 100644
  `AddUser`/`RemoveUser` mutations share one mutex, so a connection authenticated
  before deletion cannot register after the same email has been deleted or
  replaced. `RemoveUser` deletes the validator entry before closing its captured
-@@ -31,8 +32,8 @@ user's active connection.
+@@ -31,8 +32,21 @@ user's active connection.
  
  Regression coverage lives in
  `common/active_user_sessions_test.go`,
@@ -69,20 +74,342 @@ index d6b4c594..2e760f3d 100644
 +pass the upstream protocol scenarios and an external long-stream E2E for every
 +transport used by production: VLESS TCP, WebSocket, gRPC and XHTTP, plus Trojan
 +TCP, VMess TCP and Shadowsocks TCP/UDP.
++
++## Single-connection live user audit
++
++The additional version marker
++`VPnBot capability: vpnbot-live-user-audit-v1` advertises the read-only
++`xray api vpnbot-audit-users` command. The command opens one local gRPC
++connection, lists every inbound, retrieves every UserManager user, verifies
++each list through `GetInboundUsersCount`, and repeats the complete pass. It
++returns both passes as typed JSON so the VPnBot node helper can reject any
++registry drift without launching a process and gRPC connection per inbound.
++
++This command does not replace or weaken the active-revoke capability. It never
++adds or removes users and never restarts Xray.
 diff --git a/core/core.go b/core/core.go
-index e0b0c14c..c58a0752 100644
+index e0b0c14..83bdfdf 100644
 --- a/core/core.go
 +++ b/core/core.go
-@@ -70,5 +70,6 @@ func VersionStatement() []string {
+@@ -70,5 +70,7 @@ func VersionStatement() []string {
  		intro,
  		"VPnBot capability: vpnbot-active-revoke-v1",
  		"VPnBot capability: vpnbot-active-revoke-v2",
 +		"VPnBot capability: vpnbot-active-revoke-v3",
++		"VPnBot capability: vpnbot-live-user-audit-v1",
  	}
  }
+diff --git a/main/commands/all/api/api.go b/main/commands/all/api/api.go
+index 85d7aa9..30b7760 100644
+--- a/main/commands/all/api/api.go
++++ b/main/commands/all/api/api.go
+@@ -27,6 +27,7 @@ var CmdAPI = &base.Command{
+ 		cmdRemoveInboundUsers,
+ 		cmdInboundUser,
+ 		cmdInboundUserCount,
++		cmdVPnBotLiveUserAudit,
+ 		cmdAddRules,
+ 		cmdRemoveRules,
+ 		cmdListRules,
+diff --git a/main/commands/all/api/vpnbot_live_user_audit.go b/main/commands/all/api/vpnbot_live_user_audit.go
+new file mode 100644
+index 0000000..2b5bd38
+--- /dev/null
++++ b/main/commands/all/api/vpnbot_live_user_audit.go
+@@ -0,0 +1,161 @@
++package api
++
++import (
++	"context"
++	"fmt"
++	"sort"
++	"strings"
++
++	handlerService "github.com/xtls/xray-core/app/proxyman/command"
++	"github.com/xtls/xray-core/common/protocol"
++	creflect "github.com/xtls/xray-core/common/reflect"
++	"github.com/xtls/xray-core/main/commands/base"
++)
++
++const vpnbotLiveUserAuditContract = "vpnbot-live-user-audit-v1"
++
++type vpnbotLiveUserAuditInbound struct {
++	Tag         string           `json:"tag"`
++	UserManager bool             `json:"user_manager"`
++	Users       []*protocol.User `json:"users"`
++	Count       int64            `json:"count"`
++}
++
++type vpnbotLiveUserAuditPass struct {
++	Inbounds []vpnbotLiveUserAuditInbound `json:"inbounds"`
++}
++
++type vpnbotLiveUserAuditResult struct {
++	Contract       string                    `json:"contract"`
++	SnapshotPasses int                       `json:"snapshot_passes"`
++	Passes         []vpnbotLiveUserAuditPass `json:"passes"`
++}
++
++var cmdVPnBotLiveUserAudit = &base.Command{
++	CustomFlags: true,
++	UsageLine:   "{{.Exec}} api vpnbot-audit-users [--server=127.0.0.1:8080]",
++	Short:       "Audit all live inbound users over one gRPC connection",
++	Long: `
++Audit every live inbound user through one gRPC connection.
++
++The command performs two complete passes. Each UserManager list is checked
++against GetInboundUsersCount. The caller must compare the two returned passes.
++
++Arguments:
++
++	-s, -server <server:port>
++		The API server address. Default 127.0.0.1:8080
++
++	-t, -timeout <seconds>
++		Total timeout for both audit passes. Default 3
++`,
++	Run: executeVPnBotLiveUserAudit,
++}
++
++func executeVPnBotLiveUserAudit(cmd *base.Command, args []string) {
++	setSharedFlags(cmd)
++	cmd.Flag.Parse(args)
++	if len(cmd.Flag.Args()) != 0 {
++		base.Fatalf("vpnbot live user audit accepts no positional arguments")
++	}
++
++	conn, ctx, close := dialAPIServer()
++	defer close()
++	result, err := collectVPnBotLiveUserAudit(
++		ctx,
++		handlerService.NewHandlerServiceClient(conn),
++	)
++	if err != nil {
++		base.Fatalf("vpnbot live user audit failed: %s", err)
++	}
++	payload, ok := creflect.MarshalToJson(result, true)
++	if !ok {
++		base.Fatalf("vpnbot live user audit response encoding failed")
++	}
++	fmt.Println(payload)
++}
++
++func collectVPnBotLiveUserAudit(
++	ctx context.Context,
++	client handlerService.HandlerServiceClient,
++) (*vpnbotLiveUserAuditResult, error) {
++	passes := make([]vpnbotLiveUserAuditPass, 0, 2)
++	for passNumber := 0; passNumber < 2; passNumber++ {
++		pass, err := collectVPnBotLiveUserAuditPass(ctx, client)
++		if err != nil {
++			return nil, fmt.Errorf("pass %d: %w", passNumber+1, err)
++		}
++		passes = append(passes, pass)
++	}
++	return &vpnbotLiveUserAuditResult{
++		Contract:       vpnbotLiveUserAuditContract,
++		SnapshotPasses: len(passes),
++		Passes:         passes,
++	}, nil
++}
++
++func collectVPnBotLiveUserAuditPass(
++	ctx context.Context,
++	client handlerService.HandlerServiceClient,
++) (vpnbotLiveUserAuditPass, error) {
++	listed, err := client.ListInbounds(
++		ctx,
++		&handlerService.ListInboundsRequest{IsOnlyTags: true},
++	)
++	if err != nil {
++		return vpnbotLiveUserAuditPass{}, fmt.Errorf("list inbounds: %w", err)
++	}
++	tags := make([]string, 0, len(listed.GetInbounds()))
++	seen := make(map[string]struct{}, len(listed.GetInbounds()))
++	for _, inbound := range listed.GetInbounds() {
++		tag := strings.TrimSpace(inbound.GetTag())
++		if tag == "" {
++			return vpnbotLiveUserAuditPass{}, fmt.Errorf("live inbound has an empty tag")
++		}
++		if _, exists := seen[tag]; exists {
++			return vpnbotLiveUserAuditPass{}, fmt.Errorf("live inbound tag is duplicated")
++		}
++		seen[tag] = struct{}{}
++		tags = append(tags, tag)
++	}
++	sort.Strings(tags)
++
++	inbounds := make([]vpnbotLiveUserAuditInbound, 0, len(tags))
++	for _, tag := range tags {
++		request := &handlerService.GetInboundUserRequest{Tag: tag}
++		usersResponse, usersErr := client.GetInboundUsers(ctx, request)
++		if usersErr != nil {
++			message := strings.ToLower(usersErr.Error())
++			if strings.Contains(message, "not a usermanager") ||
++				strings.Contains(message, "not a user manager") {
++				inbounds = append(inbounds, vpnbotLiveUserAuditInbound{
++					Tag:         tag,
++					UserManager: false,
++					Users:       make([]*protocol.User, 0),
++					Count:       0,
++				})
++				continue
++			}
++			return vpnbotLiveUserAuditPass{}, fmt.Errorf("get inbound users: %w", usersErr)
++		}
++		users := usersResponse.GetUsers()
++		if users == nil {
++			users = make([]*protocol.User, 0)
++		}
++		countResponse, countErr := client.GetInboundUsersCount(ctx, request)
++		if countErr != nil {
++			return vpnbotLiveUserAuditPass{}, fmt.Errorf("get inbound user count: %w", countErr)
++		}
++		count := countResponse.GetCount()
++		if count < 0 || count != int64(len(users)) {
++			return vpnbotLiveUserAuditPass{}, fmt.Errorf("inbound user list changed during pass")
++		}
++		inbounds = append(inbounds, vpnbotLiveUserAuditInbound{
++			Tag:         tag,
++			UserManager: true,
++			Users:       users,
++			Count:       count,
++		})
++	}
++	return vpnbotLiveUserAuditPass{Inbounds: inbounds}, nil
++}
+diff --git a/main/commands/all/api/vpnbot_live_user_audit_test.go b/main/commands/all/api/vpnbot_live_user_audit_test.go
+new file mode 100644
+index 0000000..3ef9062
+--- /dev/null
++++ b/main/commands/all/api/vpnbot_live_user_audit_test.go
+@@ -0,0 +1,123 @@
++package api
++
++import (
++	"context"
++	"encoding/json"
++	"testing"
++
++	handlerService "github.com/xtls/xray-core/app/proxyman/command"
++	"github.com/xtls/xray-core/common/protocol"
++	creflect "github.com/xtls/xray-core/common/reflect"
++	"github.com/xtls/xray-core/common/serial"
++	"github.com/xtls/xray-core/core"
++	"github.com/xtls/xray-core/proxy/vless"
++	"google.golang.org/grpc"
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/status"
++)
++
++type vpnbotLiveUserAuditFakeClient struct {
++	handlerService.HandlerServiceClient
++	t          *testing.T
++	listCalls  int
++	userCalls  int
++	countCalls int
++}
++
++func (f *vpnbotLiveUserAuditFakeClient) ListInbounds(
++	context.Context,
++	*handlerService.ListInboundsRequest,
++	...grpc.CallOption,
++) (*handlerService.ListInboundsResponse, error) {
++	f.listCalls++
++	return &handlerService.ListInboundsResponse{Inbounds: []*core.InboundHandlerConfig{
++		{Tag: "vless-live"},
++		{Tag: "api"},
++	}}, nil
++}
++
++func (f *vpnbotLiveUserAuditFakeClient) GetInboundUsers(
++	_ context.Context,
++	request *handlerService.GetInboundUserRequest,
++	_ ...grpc.CallOption,
++) (*handlerService.GetInboundUserResponse, error) {
++	f.userCalls++
++	if request.GetTag() == "api" {
++		return nil, status.Error(codes.Unknown, "proxy is not a UserManager")
++	}
++	return &handlerService.GetInboundUserResponse{Users: []*protocol.User{
++		{
++			Level:   0,
++			Email:   "audit@example.invalid",
++			Account: serial.ToTypedMessage(&vless.Account{Id: "audit-user-id"}),
++		},
++	}}, nil
++}
++
++func (f *vpnbotLiveUserAuditFakeClient) GetInboundUsersCount(
++	_ context.Context,
++	request *handlerService.GetInboundUserRequest,
++	_ ...grpc.CallOption,
++) (*handlerService.GetInboundUsersCountResponse, error) {
++	f.countCalls++
++	if request.GetTag() != "vless-live" {
++		f.t.Fatalf("unexpected count request for %q", request.GetTag())
++	}
++	return &handlerService.GetInboundUsersCountResponse{Count: 1}, nil
++}
++
++func TestCollectVPnBotLiveUserAuditUsesTwoCompletePasses(t *testing.T) {
++	client := &vpnbotLiveUserAuditFakeClient{t: t}
++	result, err := collectVPnBotLiveUserAudit(context.Background(), client)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if result.Contract != vpnbotLiveUserAuditContract || result.SnapshotPasses != 2 {
++		t.Fatalf("unexpected result contract: %#v", result)
++	}
++	if len(result.Passes) != 2 || client.listCalls != 2 || client.userCalls != 4 || client.countCalls != 2 {
++		t.Fatalf("unexpected audit call counts: result=%#v client=%#v", result, client)
++	}
++	for _, pass := range result.Passes {
++		if len(pass.Inbounds) != 2 {
++			t.Fatalf("unexpected inbound count: %#v", pass)
++		}
++		if pass.Inbounds[0].Tag != "api" || pass.Inbounds[0].UserManager {
++			t.Fatalf("non-UserManager inbound was not preserved: %#v", pass.Inbounds[0])
++		}
++		if pass.Inbounds[1].Tag != "vless-live" || !pass.Inbounds[1].UserManager || pass.Inbounds[1].Count != 1 {
++			t.Fatalf("UserManager inbound was not audited: %#v", pass.Inbounds[1])
++		}
++	}
++}
++
++func TestVPnBotLiveUserAuditJSONPreservesTypedAccounts(t *testing.T) {
++	client := &vpnbotLiveUserAuditFakeClient{t: t}
++	result, err := collectVPnBotLiveUserAudit(context.Background(), client)
++	if err != nil {
++		t.Fatal(err)
++	}
++	payload, ok := creflect.MarshalToJson(result, true)
++	if !ok {
++		t.Fatal("live user audit result did not marshal")
++	}
++	var decoded map[string]interface{}
++	if err := json.Unmarshal([]byte(payload), &decoded); err != nil {
++		t.Fatal(err)
++	}
++	passes, ok := decoded["passes"].([]interface{})
++	if !ok || len(passes) != 2 {
++		t.Fatalf("unexpected JSON passes: %#v", decoded["passes"])
++	}
++	for _, rawPass := range passes {
++		pass := rawPass.(map[string]interface{})
++		inbounds := pass["inbounds"].([]interface{})
++		live := inbounds[1].(map[string]interface{})
++		users := live["users"].([]interface{})
++		user := users[0].(map[string]interface{})
++		account := user["account"].(map[string]interface{})
++		if account["_TypedMessage_"] != "xray.proxy.vless.Account" || account["id"] != "audit-user-id" {
++			t.Fatalf("typed VLESS account was not preserved: %#v", account)
++		}
++	}
++}
 diff --git a/proxy/shadowsocks/active_sessions_test.go b/proxy/shadowsocks/active_sessions_test.go
 new file mode 100644
-index 00000000..e0ceb490
+index 0000000..e0ceb49
 --- /dev/null
 +++ b/proxy/shadowsocks/active_sessions_test.go
 @@ -0,0 +1,71 @@
@@ -158,7 +485,7 @@ index 00000000..e0ceb490
 +	}
 +}
 diff --git a/proxy/shadowsocks/server.go b/proxy/shadowsocks/server.go
-index 360ea38c..83a52efa 100644
+index 360ea38..83a52ef 100644
 --- a/proxy/shadowsocks/server.go
 +++ b/proxy/shadowsocks/server.go
 @@ -22,10 +22,11 @@ import (
@@ -260,7 +587,7 @@ index 360ea38c..83a52efa 100644
  	inbound := session.InboundFromContext(ctx)
 diff --git a/proxy/vmess/inbound/active_sessions_test.go b/proxy/vmess/inbound/active_sessions_test.go
 new file mode 100644
-index 00000000..3a927ce8
+index 0000000..3a927ce
 --- /dev/null
 +++ b/proxy/vmess/inbound/active_sessions_test.go
 @@ -0,0 +1,80 @@
@@ -345,7 +672,7 @@ index 00000000..3a927ce8
 +	}
 +}
 diff --git a/proxy/vmess/inbound/inbound.go b/proxy/vmess/inbound/inbound.go
-index e084a881..89cc2a51 100644
+index e084a88..89cc2a5 100644
 --- a/proxy/vmess/inbound/inbound.go
 +++ b/proxy/vmess/inbound/inbound.go
 @@ -107,6 +107,7 @@ type Handler struct {
@@ -450,7 +777,7 @@ index e084a881..89cc2a51 100644
  			From:   connection.RemoteAddr(),
 diff --git a/testing/scenarios/managed_user_active_revoke_test.go b/testing/scenarios/managed_user_active_revoke_test.go
 new file mode 100644
-index 00000000..735549e1
+index 0000000..735549e
 --- /dev/null
 +++ b/testing/scenarios/managed_user_active_revoke_test.go
 @@ -0,0 +1,350 @@
@@ -804,3 +1131,6 @@ index 00000000..735549e1
 +		t.Fatal("removed Shadowsocks credential established a new UDP session")
 +	}
 +}
+-- 
+2.47.3
+

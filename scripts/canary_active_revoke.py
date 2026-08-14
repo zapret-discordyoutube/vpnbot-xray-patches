@@ -27,6 +27,81 @@ def command(args: list[str], *, timeout: float = 30) -> subprocess.CompletedProc
     )
 
 
+def live_user_audit(
+    xray: Path,
+    api_port: int,
+    inbound_tag: str,
+    expected_emails: set[str],
+) -> dict[str, Any]:
+    """Prove the one-process/two-pass command without retaining identities."""
+
+    result = command(
+        [
+            str(xray),
+            "api",
+            "vpnbot-audit-users",
+            f"--server=127.0.0.1:{api_port}",
+            "-timeout=10",
+        ],
+        timeout=15,
+    )
+    if result.returncode != 0:
+        raise RuntimeError("Xray single-connection live user audit failed")
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Xray single-connection live user audit returned invalid JSON") from exc
+    if (
+        not isinstance(payload, dict)
+        or payload.get("contract") != "vpnbot-live-user-audit-v1"
+        or payload.get("snapshot_passes") != 2
+        or not isinstance(payload.get("passes"), list)
+        or len(payload["passes"]) != 2
+    ):
+        raise RuntimeError("Xray single-connection live user audit contract is invalid")
+    normalized_passes: list[list[tuple[str, bool, int, tuple[str, ...]]]] = []
+    for snapshot in payload["passes"]:
+        inbounds = snapshot.get("inbounds") if isinstance(snapshot, dict) else None
+        if not isinstance(inbounds, list):
+            raise RuntimeError("Xray live user audit omitted inbounds")
+        normalized: list[tuple[str, bool, int, tuple[str, ...]]] = []
+        for inbound in inbounds:
+            if not isinstance(inbound, dict):
+                raise RuntimeError("Xray live user audit returned a malformed inbound")
+            users = inbound.get("users")
+            count = inbound.get("count")
+            user_manager = inbound.get("user_manager")
+            if (
+                not isinstance(users, list)
+                or not all(isinstance(user, dict) for user in users)
+                or isinstance(count, bool)
+                or not isinstance(count, int)
+                or count != len(users)
+                or not isinstance(user_manager, bool)
+            ):
+                raise RuntimeError("Xray live user audit returned invalid user evidence")
+            emails = tuple(sorted(str(user.get("email") or "").lower() for user in users))
+            normalized.append(
+                (str(inbound.get("tag") or ""), user_manager, count, emails)
+            )
+        normalized_passes.append(sorted(normalized))
+    if normalized_passes[0] != normalized_passes[1]:
+        raise RuntimeError("Xray live user registry changed between audit passes")
+    matching = [row for row in normalized_passes[0] if row[0] == inbound_tag]
+    if len(matching) != 1 or not matching[0][1]:
+        raise RuntimeError("Xray canary inbound is not auditable")
+    observed_emails = set(matching[0][3])
+    if observed_emails != {email.lower() for email in expected_emails}:
+        raise RuntimeError("Xray canary live user set does not match expectation")
+    return {
+        "snapshot_passes": 2,
+        "audited_inbound_count": len(normalized_passes[0]),
+        "expected_user_count": len(expected_emails),
+        "process_count": 1,
+        "grpc_connection_count": 1,
+    }
+
+
 def unused_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         listener.bind(("127.0.0.1", 0))
@@ -339,6 +414,12 @@ def isolated_active_revoke(xray: Path, cutoff_seconds: float) -> dict[str, Any]:
                     stream_b.start()
                     wait_for_bytes(stream_a, 512 * 1024, timeout=4)
                     wait_for_bytes(stream_b, 512 * 1024, timeout=4)
+                    audit_before = live_user_audit(
+                        xray,
+                        api_port,
+                        inbound_tag,
+                        {email_a, email_b},
+                    )
                     b_before = stream_b.bytes_echoed
                     revoke_started = time.monotonic()
                     removed = command(
@@ -357,6 +438,12 @@ def isolated_active_revoke(xray: Path, cutoff_seconds: float) -> dict[str, Any]:
                             "Xray RemoveUser API failed: "
                             + (removed.stderr.strip() or removed.stdout.strip() or str(removed.returncode))
                         )
+                    audit_after = live_user_audit(
+                        xray,
+                        api_port,
+                        inbound_tag,
+                        {email_b},
+                    )
                     if not stream_a.closed_event.wait(timeout=cutoff_seconds):
                         raise RuntimeError(
                             f"revoked stream A stayed alive longer than {cutoff_seconds:.1f} seconds"
@@ -374,6 +461,8 @@ def isolated_active_revoke(xray: Path, cutoff_seconds: float) -> dict[str, Any]:
                         "stream_a_bytes": stream_a.bytes_echoed,
                         "stream_b_bytes": stream_b.bytes_echoed,
                         "live_configuration_untouched": True,
+                        "live_user_audit_before": audit_before,
+                        "live_user_audit_after": audit_after,
                     }
                 except Exception as exc:
                     stop_process(client_process)
@@ -410,6 +499,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError(f"installed Xray does not report expected tag {args.expected_tag}")
     if args.capability not in statement:
         raise RuntimeError(f"installed Xray lacks capability {args.capability}")
+    if args.live_audit_capability not in statement:
+        raise RuntimeError(
+            f"installed Xray lacks capability {args.live_audit_capability}"
+        )
     config = command(
         [str(xray), "run", "-confdir", str(args.config_dir), "-dump"],
         timeout=45,
@@ -431,6 +524,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "service_active": True,
             "expected_version": True,
             "required_capability": True,
+            "single_connection_live_user_audit": True,
             "live_config_valid": True,
             "isolated_active_revoke": True,
             "unrelated_stream_survived": True,
@@ -447,6 +541,10 @@ def main() -> int:
     parser.add_argument("--service", default="vpnbot-xray.service")
     parser.add_argument("--expected-tag", required=True)
     parser.add_argument("--capability", default="vpnbot-active-revoke-v3")
+    parser.add_argument(
+        "--live-audit-capability",
+        default="vpnbot-live-user-audit-v1",
+    )
     parser.add_argument("--cutoff-seconds", type=float, default=10.0)
     args = parser.parse_args()
     try:

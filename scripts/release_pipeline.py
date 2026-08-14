@@ -24,8 +24,9 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 CAPABILITY = "vpnbot-active-revoke-v3"
+LIVE_USER_AUDIT_CAPABILITY = "vpnbot-live-user-audit-v1"
 BUILD_PROFILE = "linux-cpu-profiles-v2"
 OFFICIAL_REPOSITORY = "https://github.com/XTLS/Xray-core.git"
 OFFICIAL_RELEASES_FEED = "https://github.com/XTLS/Xray-core/releases.atom"
@@ -356,6 +357,8 @@ def same_source_and_patches(manifest: dict[str, Any], commit: str, patchset: str
         manifest.get("upstream", {}).get("commit") == commit
         and manifest.get("patches", {}).get("set_sha256") == patchset
         and manifest.get("capability") == CAPABILITY
+        and manifest.get("live_user_audit_capability")
+        == LIVE_USER_AUDIT_CAPABILITY
         and manifest.get("build_profile") == BUILD_PROFILE
     )
 
@@ -539,6 +542,7 @@ def manifest_command(args: argparse.Namespace) -> int:
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "capability": CAPABILITY,
+        "live_user_audit_capability": LIVE_USER_AUDIT_CAPABILITY,
         "build_profile": BUILD_PROFILE,
         "upstream": {
             "repository": values["XRAY_UPSTREAM_REPOSITORY"],
@@ -564,13 +568,23 @@ def manifest_command(args: argparse.Namespace) -> int:
 
 
 def validate_manifest(manifest: Any) -> None:
-    if not isinstance(manifest, dict) or manifest.get("schema_version") not in {1, SCHEMA_VERSION}:
+    if not isinstance(manifest, dict) or manifest.get("schema_version") not in {
+        1,
+        2,
+        SCHEMA_VERSION,
+    }:
         raise PipelineError("unsupported release manifest schema")
     schema_version = int(manifest["schema_version"])
     if manifest.get("capability") != CAPABILITY:
         raise PipelineError("release manifest capability mismatch")
-    if schema_version == SCHEMA_VERSION and manifest.get("build_profile") != BUILD_PROFILE:
+    if schema_version >= 2 and manifest.get("build_profile") != BUILD_PROFILE:
         raise PipelineError("release manifest build profile mismatch")
+    if (
+        schema_version >= 3
+        and manifest.get("live_user_audit_capability")
+        != LIVE_USER_AUDIT_CAPABILITY
+    ):
+        raise PipelineError("release manifest live-user-audit capability mismatch")
     upstream = manifest.get("upstream")
     release = manifest.get("release")
     patches = manifest.get("patches")
@@ -631,7 +645,7 @@ def validate_manifest(manifest: Any) -> None:
             or item["size"] <= 0
         ):
             raise PipelineError(f"release manifest asset metadata is invalid: {name}")
-        if schema_version == SCHEMA_VERSION and name in ARTIFACT_PROFILES:
+        if schema_version >= 2 and name in ARTIFACT_PROFILES:
             expected_profile = ARTIFACT_PROFILES[name]
             actual_profile = {
                 key: item.get(key)

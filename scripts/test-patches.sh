@@ -12,6 +12,7 @@ trap 'rm -rf -- "$TEMP_DIRECTORY"' EXIT HUP INT TERM
 cd "${TEMP_DIRECTORY}/xray"
 go test -timeout 30m \
     ./common \
+    ./main/commands/all/api \
     ./proxy/vless/inbound \
     ./proxy/trojan \
     ./proxy/vmess/inbound \

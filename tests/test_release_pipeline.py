@@ -286,6 +286,9 @@ class ReleasePipelineTests(unittest.TestCase):
         manifest = {
             "schema_version": release_pipeline.SCHEMA_VERSION,
             "capability": release_pipeline.CAPABILITY,
+            "live_user_audit_capability": (
+                release_pipeline.LIVE_USER_AUDIT_CAPABILITY
+            ),
             "build_profile": release_pipeline.BUILD_PROFILE,
             "upstream": {
                 "repository": release_pipeline.OFFICIAL_REPOSITORY,
@@ -321,6 +324,32 @@ class ReleasePipelineTests(unittest.TestCase):
         }
 
         self.assertFalse(
+            release_pipeline.same_source_and_patches(
+                manifest,
+                "a" * 40,
+                "b" * 64,
+            )
+        )
+
+    def test_live_user_audit_capability_forces_a_new_release_edition(self) -> None:
+        manifest = {
+            "upstream": {"commit": "a" * 40},
+            "patches": {"set_sha256": "b" * 64},
+            "capability": release_pipeline.CAPABILITY,
+            "build_profile": release_pipeline.BUILD_PROFILE,
+        }
+
+        self.assertFalse(
+            release_pipeline.same_source_and_patches(
+                manifest,
+                "a" * 40,
+                "b" * 64,
+            )
+        )
+        manifest["live_user_audit_capability"] = (
+            release_pipeline.LIVE_USER_AUDIT_CAPABILITY
+        )
+        self.assertTrue(
             release_pipeline.same_source_and_patches(
                 manifest,
                 "a" * 40,

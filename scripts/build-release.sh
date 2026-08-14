@@ -97,6 +97,9 @@ build_target() {
         "${package_directory}/xray" version \
             | grep -Fq 'VPnBot capability: vpnbot-active-revoke-v3' \
             || fail "the built Xray binary does not expose the v3 capability marker"
+        "${package_directory}/xray" version \
+            | grep -Fq 'VPnBot capability: vpnbot-live-user-audit-v1' \
+            || fail "the built Xray binary does not expose the live-user-audit marker"
     fi
     cp -- "${SOURCE_DIRECTORY}/README.md" "${package_directory}/README.md"
     cp -- "${SOURCE_DIRECTORY}/LICENSE" "${package_directory}/LICENSE"
