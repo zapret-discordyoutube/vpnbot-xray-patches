@@ -408,6 +408,22 @@ class ReleasePipelineTests(unittest.TestCase):
         self.assertIn("build_target Xray-linux-64-v3.zip amd64 \"\" v3", source)
         self.assertIn('go_environment+=("GOAMD64=${goamd64}")', source)
 
+    def test_build_script_captures_version_before_capability_checks(self) -> None:
+        source = (ROOT / "scripts" / "build-release.sh").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn(
+            'version_statement="$("${package_directory}/xray" version)"',
+            source,
+        )
+        self.assertIn(
+            "[[ \"$version_statement\" == *'VPnBot capability: "
+            "vpnbot-live-user-audit-v1'* ]]",
+            source,
+        )
+        self.assertNotIn('xray" version \\\n            | grep -Fq', source)
+
     def test_proof_is_bound_to_the_exact_manifest(self) -> None:
         manifest_bytes = b'{"schema_version":1}\n'
         manifest = {"release": {"candidate_tag": "v26.7.28-vpnbot.4-candidate.1"}}

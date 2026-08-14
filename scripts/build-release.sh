@@ -94,11 +94,11 @@ build_target() {
 
     chmod 0755 "${package_directory}/xray"
     if [[ "$goarch" == amd64 ]]; then
-        "${package_directory}/xray" version \
-            | grep -Fq 'VPnBot capability: vpnbot-active-revoke-v3' \
+        version_statement="$("${package_directory}/xray" version)" \
+            || fail "the built Xray binary did not report its version"
+        [[ "$version_statement" == *'VPnBot capability: vpnbot-active-revoke-v3'* ]] \
             || fail "the built Xray binary does not expose the v3 capability marker"
-        "${package_directory}/xray" version \
-            | grep -Fq 'VPnBot capability: vpnbot-live-user-audit-v1' \
+        [[ "$version_statement" == *'VPnBot capability: vpnbot-live-user-audit-v1'* ]] \
             || fail "the built Xray binary does not expose the live-user-audit marker"
     fi
     cp -- "${SOURCE_DIRECTORY}/README.md" "${package_directory}/README.md"
