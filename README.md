@@ -103,7 +103,18 @@ Forgejo может показывать публичные Actions-запуск�
 
 Для наблюдателя нужен `/etc/vpnbot-xray-release-alert.env` по отдельному примеру
 из `systemd/`. В нём нет токена Telegram: скрипт читает только
-`VPNBOT_BOT_TOKEN` из существующего root-only runtime-env VPnBot. Долговечное
+`VPNBOT_BOT_TOKEN` из существующего root-only runtime-env VPnBot. Из того же
+файла он берёт сетевой контракт Telegram, общий для всех процессов бота:
+`VPNBOT_TELEGRAM_IP_FAMILY` (по умолчанию `ipv4`),
+`VPNBOT_TELEGRAM_API_FALLBACK_IPV4S` и необязательный
+`VPNBOT_TELEGRAM_EGRESS_HEALTH_PATH`. Пока свежая проекция node manager
+`/run/vpnbot-node-manager/telegram-egress.json` называет здоровые relay-порты
+`api.telegram.org`, запрос идёт только через них (`127.0.0.1:<порт>`, TLS с SNI
+и проверкой сертификата `api.telegram.org`); иначе — резервные IPv4 и DNS только
+выбранного семейства. Отказ доставки печатается typed-кодом:
+`telegram_connect_failed` и `telegram_no_route` гарантируют, что запрос не ушёл;
+`telegram_delivery_ambiguous` — запрос ушёл без ответа и в этом запуске на
+другой адрес не повторяется. Долговечное
 состояние дедупликации хранится в
 `/var/lib/vpnbot-xray-release-alert/state.json` и никак не участвует в решении о
 публикации proven.

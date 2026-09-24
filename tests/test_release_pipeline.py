@@ -774,5 +774,369 @@ class ReleasePipelineTests(unittest.TestCase):
                 self.assertEqual(lock_path.stat().st_mode & 0o777, 0o600)
 
 
+
+TOKEN = "123456789:" + "A" * 35
+
+
+class TelegramEgressContractTests(unittest.TestCase):
+    """The observer reaches Telegram through the host egress contract."""
+
+    @staticmethod
+    def runtime(**overrides: object) -> release_alert_monitor.BotRuntime:
+        values: dict[str, object] = {
+            "token": TOKEN,
+            "ip_family": release_alert_monitor.socket.AF_INET,
+            "fallback_ipv4s": ("149.154.167.220",),
+            "egress_health_path": Path("/nonexistent/telegram-egress.json"),
+        }
+        values.update(overrides)
+        return release_alert_monitor.BotRuntime(**values)  # type: ignore[arg-type]
+
+    @staticmethod
+    def write_env(directory: Path, text: str) -> Path:
+        path = directory / "vpnbot.env"
+        path.write_text(text, encoding="utf-8")
+        path.chmod(0o600)
+        return path
+
+    @staticmethod
+    def write_projection(directory: Path, payload: dict[str, object]) -> Path:
+        path = directory / "telegram-egress.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return path
+
+    def assert_code(self, raised: unittest.case._AssertRaisesContext, code: str) -> None:  # type: ignore[name-defined]
+        self.assertEqual(raised.exception.code, code)
+        self.assertNotIn(TOKEN, str(raised.exception))
+
+    def test_runtime_reads_the_bot_egress_policy_next_to_the_token(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            path = self.write_env(
+                Path(raw_tmp),
+                f"VPNBOT_BOT_TOKEN={TOKEN}\n"
+                "VPNBOT_TELEGRAM_IP_FAMILY=ipv4\n"
+                "VPNBOT_TELEGRAM_API_FALLBACK_IPV4S='149.154.167.220; 149.154.167.220,149.154.175.50'\n"
+                "UNRELATED=1\n",
+            )
+            runtime = release_alert_monitor.load_bot_runtime(path)
+        self.assertEqual(runtime.token, TOKEN)
+        self.assertEqual(runtime.ip_family, release_alert_monitor.socket.AF_INET)
+        self.assertEqual(runtime.fallback_ipv4s, ("149.154.167.220", "149.154.175.50"))
+        self.assertEqual(
+            runtime.egress_health_path,
+            release_alert_monitor.DEFAULT_TELEGRAM_EGRESS_HEALTH_PATH,
+        )
+
+    def test_runtime_defaults_to_ipv4_like_the_bot(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            path = self.write_env(
+                Path(raw_tmp),
+                f"VPNBOT_BOT_TOKEN={TOKEN}\nVPNBOT_TELEGRAM_IP_FAMILY=\n",
+            )
+            runtime = release_alert_monitor.load_bot_runtime(path)
+        self.assertEqual(runtime.ip_family, release_alert_monitor.socket.AF_INET)
+        self.assertEqual(runtime.fallback_ipv4s, ())
+
+    def test_runtime_rejects_an_invalid_egress_policy_with_a_typed_code(self) -> None:
+        for line in (
+            "VPNBOT_TELEGRAM_IP_FAMILY=carrier-pigeon",
+            "VPNBOT_TELEGRAM_API_FALLBACK_IPV4S=2001:67c:4e8::1",
+            "VPNBOT_TELEGRAM_API_FALLBACK_IPV4S=not-an-ip",
+            "VPNBOT_TELEGRAM_EGRESS_HEALTH_PATH=relative/egress.json",
+        ):
+            with self.subTest(line=line), tempfile.TemporaryDirectory() as raw_tmp:
+                path = self.write_env(Path(raw_tmp), f"VPNBOT_BOT_TOKEN={TOKEN}\n{line}\n")
+                with self.assertRaises(release_alert_monitor.TelegramDeliveryError) as raised:
+                    release_alert_monitor.load_bot_runtime(path)
+                self.assert_code(raised, release_alert_monitor.TELEGRAM_EGRESS_CONFIG_INVALID)
+
+    def test_runtime_refuses_a_duplicated_egress_key(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            path = self.write_env(
+                Path(raw_tmp),
+                f"VPNBOT_BOT_TOKEN={TOKEN}\n"
+                "VPNBOT_TELEGRAM_IP_FAMILY=ipv4\n"
+                "VPNBOT_TELEGRAM_IP_FAMILY=ipv6\n",
+            )
+            with self.assertRaisesRegex(release_pipeline.PipelineError, "duplicate"):
+                release_alert_monitor.load_bot_runtime(path)
+
+    def test_fresh_projection_yields_only_bot_api_relay_ports(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            path = self.write_projection(
+                Path(raw_tmp),
+                {
+                    "schema": 1,
+                    "updated_at_monotonic": 1_000.0,
+                    "healthy_ports_by_host": {
+                        "api.telegram.org": [18444, 18443],
+                        "t.me": [18445],
+                    },
+                },
+            )
+            self.assertEqual(
+                release_alert_monitor.healthy_relay_ports(path, monotonic=lambda: 1_010.0),
+                (18443, 18444),
+            )
+            # A frozen writer is not evidence: stale means no relay.
+            self.assertEqual(
+                release_alert_monitor.healthy_relay_ports(path, monotonic=lambda: 1_046.0),
+                (),
+            )
+
+    def test_absent_or_foreign_projection_yields_no_relay(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            directory = Path(raw_tmp)
+            self.assertEqual(
+                release_alert_monitor.healthy_relay_ports(directory / "absent.json"), ()
+            )
+            for payload in (
+                {"schema": 2, "updated_at_monotonic": 1.0, "healthy_ports_by_host": {}},
+                {"schema": 1, "updated_at_monotonic": True, "healthy_ports_by_host": {}},
+                {
+                    "schema": 1,
+                    "updated_at_monotonic": 1.0,
+                    "healthy_ports_by_host": {"api.telegram.org": [80]},
+                },
+            ):
+                with self.subTest(payload=payload):
+                    path = self.write_projection(directory, payload)
+                    self.assertEqual(
+                        release_alert_monitor.healthy_relay_ports(path, monotonic=lambda: 2.0),
+                        (),
+                    )
+            (directory / "broken.json").write_text("{", encoding="utf-8")
+            self.assertEqual(
+                release_alert_monitor.healthy_relay_ports(directory / "broken.json"), ()
+            )
+
+    def test_healthy_relay_is_used_exclusively(self) -> None:
+        def resolve(*_args: object) -> list[object]:
+            raise AssertionError("direct DNS must not be consulted beside a healthy relay")
+
+        routes = release_alert_monitor.telegram_routes(
+            self.runtime(),
+            resolve=resolve,
+            relay_ports=lambda _path: (18443, 18444),
+        )
+        self.assertEqual(
+            [(route.kind, route.address, route.port) for route in routes],
+            [("relay", "127.0.0.1", 18443), ("relay", "127.0.0.1", 18444)],
+        )
+
+    def test_direct_path_is_ipv4_only_with_fallbacks_first(self) -> None:
+        socket_module = release_alert_monitor.socket
+        calls: list[tuple[object, ...]] = []
+
+        def resolve(*args: object) -> list[object]:
+            calls.append(args)
+            return [
+                (socket_module.AF_INET, socket_module.SOCK_STREAM, 6, "", ("149.154.166.110", 443)),
+                (socket_module.AF_INET, socket_module.SOCK_STREAM, 6, "", ("149.154.167.220", 443)),
+                (socket_module.AF_INET6, socket_module.SOCK_STREAM, 6, "", ("2001:67c:4e8:f004::9", 443, 0, 0)),
+            ]
+
+        routes = release_alert_monitor.telegram_routes(
+            self.runtime(), resolve=resolve, relay_ports=lambda _path: ()
+        )
+        self.assertEqual(
+            [(route.kind, route.address, route.family) for route in routes],
+            [
+                ("direct", "149.154.167.220", socket_module.AF_INET),
+                ("direct", "149.154.166.110", socket_module.AF_INET),
+            ],
+        )
+        self.assertEqual(calls[0][:3], ("api.telegram.org", 443, socket_module.AF_INET))
+
+    def test_dns_failure_uses_fallbacks_and_without_them_is_no_route(self) -> None:
+        def resolve(*_args: object) -> list[object]:
+            raise OSError("temporary failure in name resolution")
+
+        routes = release_alert_monitor.telegram_routes(
+            self.runtime(), resolve=resolve, relay_ports=lambda _path: ()
+        )
+        self.assertEqual([route.address for route in routes], ["149.154.167.220"])
+        with self.assertRaises(release_alert_monitor.TelegramDeliveryError) as raised:
+            release_alert_monitor.telegram_routes(
+                self.runtime(fallback_ipv4s=()),
+                resolve=resolve,
+                relay_ports=lambda _path: (),
+            )
+        self.assert_code(raised, release_alert_monitor.TELEGRAM_NO_ROUTE)
+
+    def test_sender_moves_to_the_next_route_only_before_sending(self) -> None:
+        routes = [
+            release_alert_monitor.TelegramRoute("relay", "127.0.0.1", port, release_alert_monitor.socket.AF_INET)
+            for port in (18443, 18444)
+        ]
+        posted: list[int] = []
+
+        def post(route: object, path: str, payload: bytes, **_kwargs: object) -> object:
+            posted.append(route.port)  # type: ignore[attr-defined]
+            self.assertEqual(path, f"/bot{TOKEN}/sendMessage")
+            self.assertEqual(json.loads(payload)["chat_id"], "6483277608")
+            if route.port == 18443:  # type: ignore[attr-defined]
+                return None
+            return 200, b'{"ok": true, "result": {"message_id": 77}}'
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            send = release_alert_monitor.telegram_sender(
+                ReleasePipelineTests.alert_settings(Path(raw_tmp)),
+                self.runtime(),
+                routes=lambda _runtime: routes,
+                post=post,
+                tls_context_factory=lambda: None,  # type: ignore[arg-type,return-value]
+            )
+            self.assertEqual(send("hello"), 77)
+        self.assertEqual(posted, [18443, 18444])
+
+    def test_sender_reports_connect_failure_when_no_route_connects(self) -> None:
+        routes = [
+            release_alert_monitor.TelegramRoute("direct", "149.154.167.220", 443, release_alert_monitor.socket.AF_INET)
+        ]
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            send = release_alert_monitor.telegram_sender(
+                ReleasePipelineTests.alert_settings(Path(raw_tmp)),
+                self.runtime(),
+                routes=lambda _runtime: routes,
+                post=lambda *_a, **_k: None,
+                tls_context_factory=lambda: None,  # type: ignore[arg-type,return-value]
+            )
+            with self.assertRaises(release_alert_monitor.TelegramDeliveryError) as raised:
+                send("hello")
+        self.assert_code(raised, release_alert_monitor.TELEGRAM_CONNECT_FAILED)
+        self.assertIn("149.154.167.220:443", str(raised.exception))
+
+    def test_ambiguous_delivery_is_never_resent_on_another_route(self) -> None:
+        routes = [
+            release_alert_monitor.TelegramRoute("relay", "127.0.0.1", port, release_alert_monitor.socket.AF_INET)
+            for port in (18443, 18444)
+        ]
+        posted: list[int] = []
+
+        def post(route: object, *_args: object, **_kwargs: object) -> object:
+            posted.append(route.port)  # type: ignore[attr-defined]
+            raise release_alert_monitor.TelegramDeliveryError(
+                release_alert_monitor.TELEGRAM_DELIVERY_AMBIGUOUS, "no response"
+            )
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            send = release_alert_monitor.telegram_sender(
+                ReleasePipelineTests.alert_settings(Path(raw_tmp)),
+                self.runtime(),
+                routes=lambda _runtime: routes,
+                post=post,
+                tls_context_factory=lambda: None,  # type: ignore[arg-type,return-value]
+            )
+            with self.assertRaises(release_alert_monitor.TelegramDeliveryError) as raised:
+                send("hello")
+        self.assertEqual(raised.exception.code, release_alert_monitor.TELEGRAM_DELIVERY_AMBIGUOUS)
+        self.assertEqual(posted, [18443])
+
+    def test_sender_types_http_and_rejection_answers(self) -> None:
+        cases = (
+            ((403, b'{"ok": false}'), release_alert_monitor.TELEGRAM_HTTP_STATUS),
+            ((200, b"not json"), release_alert_monitor.TELEGRAM_RESPONSE_INVALID),
+            ((200, b'{"ok": false, "result": {"message_id": 1}}'), release_alert_monitor.TELEGRAM_REJECTED),
+        )
+        route = release_alert_monitor.TelegramRoute("relay", "127.0.0.1", 18443, release_alert_monitor.socket.AF_INET)
+        for answer, code in cases:
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as raw_tmp:
+                send = release_alert_monitor.telegram_sender(
+                    ReleasePipelineTests.alert_settings(Path(raw_tmp)),
+                    self.runtime(),
+                    routes=lambda _runtime: [route],
+                    post=lambda *_a, _answer=answer, **_k: _answer,
+                    tls_context_factory=lambda: None,  # type: ignore[arg-type,return-value]
+                )
+                with self.assertRaises(release_alert_monitor.TelegramDeliveryError) as raised:
+                    send("hello")
+                self.assert_code(raised, code)
+
+    def test_pinned_connection_keeps_telegram_sni_and_certificate_over_a_relay(self) -> None:
+        import http.server
+        import ssl
+        import threading
+
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            directory = Path(raw_tmp)
+            cert = directory / "cert.pem"
+            key = directory / "key.pem"
+            subprocess.run(
+                [
+                    "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                    "-keyout", str(key), "-out", str(cert), "-days", "1",
+                    "-subj", "/CN=api.telegram.org",
+                    "-addext", "subjectAltName=DNS:api.telegram.org",
+                ],
+                check=True,
+                capture_output=True,
+            )
+            seen: dict[str, object] = {}
+
+            class Handler(http.server.BaseHTTPRequestHandler):
+                def do_POST(self) -> None:
+                    length = int(self.headers["Content-Length"])
+                    seen["path"] = self.path
+                    seen["body"] = json.loads(self.rfile.read(length))
+                    body = b'{"ok": true, "result": {"message_id": 501}}'
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+                def log_message(self, *_args: object) -> None:
+                    return None
+
+            server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            server_context.load_cert_chain(cert, key)
+
+            def remember_sni(_sock: object, name: str | None, _ctx: object) -> None:
+                seen["sni"] = name
+
+            server_context.sni_callback = remember_sni
+            server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+            server.socket = server_context.wrap_socket(server.socket, server_side=True)
+            thread = threading.Thread(target=server.handle_request, daemon=True)
+            thread.start()
+            try:
+                route = release_alert_monitor.TelegramRoute(
+                    "relay", "127.0.0.1", server.server_address[1], release_alert_monitor.socket.AF_INET
+                )
+                send = release_alert_monitor.telegram_sender(
+                    ReleasePipelineTests.alert_settings(directory),
+                    self.runtime(),
+                    routes=lambda _runtime: [route],
+                    tls_context_factory=lambda: ssl.create_default_context(cafile=str(cert)),
+                )
+                self.assertEqual(send("hello"), 501)
+            finally:
+                thread.join(timeout=10)
+                server.server_close()
+        self.assertEqual(seen["sni"], "api.telegram.org")
+        self.assertEqual(seen["path"], f"/bot{TOKEN}/sendMessage")
+        self.assertEqual(seen["body"]["text"], "hello")  # type: ignore[index]
+
+    def test_refused_relay_port_is_a_connect_failure_not_an_ambiguous_send(self) -> None:
+        import ssl
+
+        probe = release_alert_monitor.socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        route = release_alert_monitor.TelegramRoute(
+            "relay", "127.0.0.1", port, release_alert_monitor.socket.AF_INET
+        )
+        self.assertIsNone(
+            release_alert_monitor.post_telegram(
+                route,
+                "/botX/sendMessage",
+                b"{}",
+                timeout=2,
+                tls_context=ssl.create_default_context(),
+            )
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

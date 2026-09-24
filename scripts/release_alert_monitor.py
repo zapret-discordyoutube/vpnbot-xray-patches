@@ -9,10 +9,14 @@ import dataclasses
 import datetime as dt
 import fcntl
 import html
+import http.client
+import ipaddress
 import json
 import os
 import re
 import shlex
+import socket
+import ssl
 import stat
 import sys
 import time
@@ -52,6 +56,78 @@ ALERT_ENV_NAMES = {
     "VPNBOT_XRAY_ALERT_RETRY_SECONDS",
     "VPNBOT_XRAY_ALERT_REQUEST_TIMEOUT_SECONDS",
 }
+
+# Telegram egress contract of the VPnBot host.  Every process that owns the bot
+# must reach Telegram through the same endpoint policy (VPnBot
+# ``deployment/service_env_profiles.py`` ``_BOT_IDENTITY``,
+# ``telegram_client.py``, ``telegram_egress.py``): the production uplink has no
+# IPv6 route and black-holes some Telegram IPv4 addresses, so a plain
+# ``urlopen`` spends its whole timeout on a dead address and then fails with
+# ENETUNREACH on IPv6.  The contract is read from the bot's own runtime env and
+# the node manager's relay projection, never copied into this repository.
+TELEGRAM_API_HOST = "api.telegram.org"
+TELEGRAM_API_PORT = 443
+TELEGRAM_IP_FAMILY_KEY = "VPNBOT_TELEGRAM_IP_FAMILY"
+TELEGRAM_FALLBACK_IPV4S_KEY = "VPNBOT_TELEGRAM_API_FALLBACK_IPV4S"
+TELEGRAM_EGRESS_HEALTH_PATH_KEY = "VPNBOT_TELEGRAM_EGRESS_HEALTH_PATH"
+BOT_TOKEN_KEY = "VPNBOT_BOT_TOKEN"
+BOT_RUNTIME_KEYS = (
+    BOT_TOKEN_KEY,
+    TELEGRAM_IP_FAMILY_KEY,
+    TELEGRAM_FALLBACK_IPV4S_KEY,
+    TELEGRAM_EGRESS_HEALTH_PATH_KEY,
+)
+DEFAULT_TELEGRAM_EGRESS_HEALTH_PATH = Path(
+    "/run/vpnbot-node-manager/telegram-egress.json"
+)
+# Same freshness bound as the bot (``TELEGRAM_RELAY_HEALTH_STALE_SECONDS``):
+# a projection whose writer stopped ticking is not evidence of a healthy relay.
+TELEGRAM_RELAY_HEALTH_STALE_SECONDS = 45.0
+TELEGRAM_RESPONSE_LIMIT_BYTES = 1024 * 1024
+
+# Typed delivery failure codes.  ``telegram_connect_failed`` and
+# ``telegram_no_route`` guarantee that no request byte reached Telegram;
+# ``telegram_delivery_ambiguous`` means the request was sent and Telegram may
+# have accepted it, so it is never retried on another address in the same run.
+TELEGRAM_EGRESS_CONFIG_INVALID = "telegram_egress_config_invalid"
+TELEGRAM_NO_ROUTE = "telegram_no_route"
+TELEGRAM_CONNECT_FAILED = "telegram_connect_failed"
+TELEGRAM_DELIVERY_AMBIGUOUS = "telegram_delivery_ambiguous"
+TELEGRAM_HTTP_STATUS = "telegram_http_status"
+TELEGRAM_RESPONSE_INVALID = "telegram_response_invalid"
+TELEGRAM_REJECTED = "telegram_rejected"
+
+
+class TelegramDeliveryError(release_pipeline.PipelineError):
+    """Telegram delivery failed with one typed, secret-free code."""
+
+    def __init__(self, code: str, detail: str) -> None:
+        self.code = code
+        self.detail = detail
+        super().__init__(f"{code}: {detail}")
+
+
+@dataclasses.dataclass(frozen=True)
+class BotRuntime:
+    """The bot identity and Telegram endpoint policy from the bot runtime env."""
+
+    token: str
+    ip_family: socket.AddressFamily
+    fallback_ipv4s: tuple[str, ...]
+    egress_health_path: Path
+
+
+@dataclasses.dataclass(frozen=True)
+class TelegramRoute:
+    """One TCP destination for ``api.telegram.org``; TLS still verifies the host."""
+
+    kind: str
+    address: str
+    port: int
+    family: socket.AddressFamily
+
+    def label(self) -> str:
+        return f"{self.kind} {self.address}:{self.port}"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -237,9 +313,50 @@ def load_alert_environment(path: Path | None = None) -> None:
         )
 
 
-def load_bot_token(path: Path) -> str:
+def parse_telegram_ip_family(raw: str) -> socket.AddressFamily:
+    """The bot's ``VPNBOT_TELEGRAM_IP_FAMILY``; empty keeps its IPv4 default."""
+
+    configured = raw.strip().lower()
+    if configured in {"", "ipv4", "inet", "inet4", "4"}:
+        return socket.AF_INET
+    if configured in {"auto", "dual", "dual-stack", "unspec"}:
+        return socket.AF_UNSPEC
+    if configured in {"ipv6", "inet6", "6"}:
+        return socket.AF_INET6
+    raise TelegramDeliveryError(
+        TELEGRAM_EGRESS_CONFIG_INVALID,
+        f"{TELEGRAM_IP_FAMILY_KEY} has an unknown value",
+    )
+
+
+def parse_telegram_fallback_ipv4s(raw: str) -> tuple[str, ...]:
+    """The bot's ``VPNBOT_TELEGRAM_API_FALLBACK_IPV4S``: IPv4 only, deduplicated."""
+
+    result: list[str] = []
+    for candidate in raw.replace(";", ",").split(","):
+        candidate = candidate.strip()
+        if not candidate:
+            continue
+        try:
+            parsed = ipaddress.ip_address(candidate)
+        except ValueError as exc:
+            raise TelegramDeliveryError(
+                TELEGRAM_EGRESS_CONFIG_INVALID,
+                f"{TELEGRAM_FALLBACK_IPV4S_KEY} contains an invalid IP",
+            ) from exc
+        if parsed.version != 4:
+            raise TelegramDeliveryError(
+                TELEGRAM_EGRESS_CONFIG_INVALID,
+                f"{TELEGRAM_FALLBACK_IPV4S_KEY} accepts IPv4 addresses only",
+            )
+        if str(parsed) not in result:
+            result.append(str(parsed))
+    return tuple(result)
+
+
+def load_bot_runtime(path: Path) -> BotRuntime:
     require_safe_regular_file(path, "VPnBot runtime env")
-    token = ""
+    values: dict[str, str] = {}
     for number, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
         line = raw_line.strip()
         if not line or line.startswith("#"):
@@ -247,14 +364,208 @@ def load_bot_token(path: Path) -> str:
         if "=" not in line:
             continue
         name, raw_value = line.split("=", 1)
-        if name.strip() != "VPNBOT_BOT_TOKEN":
+        name = name.strip()
+        if name not in BOT_RUNTIME_KEYS:
             continue
-        if token:
-            raise release_pipeline.PipelineError("duplicate VPNBOT_BOT_TOKEN in runtime env")
-        token = parse_env_value(raw_value.strip(), f"VPNBOT_BOT_TOKEN at line {number}")
+        if name in values:
+            raise release_pipeline.PipelineError(f"duplicate {name} in runtime env")
+        raw_value = raw_value.strip()
+        values[name] = (
+            parse_env_value(raw_value, f"{name} at line {number}") if raw_value else ""
+        )
+    token = values.get(BOT_TOKEN_KEY, "")
     if not re.fullmatch(r"[1-9][0-9]{5,}:[A-Za-z0-9_-]{20,}", token):
         raise release_pipeline.PipelineError("VPNBOT_BOT_TOKEN is missing or malformed")
-    return token
+    health_path = Path(
+        values.get(TELEGRAM_EGRESS_HEALTH_PATH_KEY)
+        or DEFAULT_TELEGRAM_EGRESS_HEALTH_PATH
+    )
+    if not health_path.is_absolute():
+        raise TelegramDeliveryError(
+            TELEGRAM_EGRESS_CONFIG_INVALID,
+            f"{TELEGRAM_EGRESS_HEALTH_PATH_KEY} must be absolute",
+        )
+    return BotRuntime(
+        token=token,
+        ip_family=parse_telegram_ip_family(values.get(TELEGRAM_IP_FAMILY_KEY, "")),
+        fallback_ipv4s=parse_telegram_fallback_ipv4s(
+            values.get(TELEGRAM_FALLBACK_IPV4S_KEY, "")
+        ),
+        egress_health_path=health_path,
+    )
+
+
+def healthy_relay_ports(
+    path: Path, *, monotonic: Callable[[], float] = time.monotonic
+) -> tuple[int, ...]:
+    """Healthy loopback relay ports for the Bot API from the manager projection.
+
+    Only a fresh, well-formed projection routes.  An absent, unreadable,
+    foreign-schema or stale file yields no relay and the sender takes the
+    direct path, exactly as the bot's ``read_healthy_relay_ports`` does.
+    """
+
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return ()
+    try:
+        raw = json.loads(text)
+    except json.JSONDecodeError:
+        return ()
+    if not isinstance(raw, dict) or raw.get("schema") != 1:
+        return ()
+    observed = raw.get("updated_at_monotonic")
+    if isinstance(observed, bool) or not isinstance(observed, (int, float)):
+        return ()
+    age = monotonic() - float(observed)
+    if age < -5.0 or age > TELEGRAM_RELAY_HEALTH_STALE_SECONDS:
+        return ()
+    by_host = raw.get("healthy_ports_by_host")
+    if not isinstance(by_host, dict):
+        return ()
+    ports = by_host.get(TELEGRAM_API_HOST)
+    if not isinstance(ports, list):
+        return ()
+    result: list[int] = []
+    for port in ports:
+        if isinstance(port, bool) or not isinstance(port, int) or not 1024 <= port <= 65535:
+            return ()
+        if port not in result:
+            result.append(port)
+    return tuple(sorted(result))
+
+
+def telegram_routes(
+    runtime: BotRuntime,
+    *,
+    resolve: Callable[..., list[Any]] = socket.getaddrinfo,
+    relay_ports: Callable[[Path], tuple[int, ...]] = healthy_relay_ports,
+) -> list[TelegramRoute]:
+    """Ordered TCP destinations for the Bot API under the host egress contract.
+
+    A healthy manager relay is used exclusively: the direct uplink is the path
+    whose Telegram traffic is black-holed.  Without one, the operator's
+    fallback IPv4 addresses come first, then DNS restricted to the configured
+    address family — never IPv6 when the bot is IPv4-only.
+    """
+
+    ports = relay_ports(runtime.egress_health_path)
+    if ports:
+        return [
+            TelegramRoute("relay", "127.0.0.1", port, socket.AF_INET) for port in ports
+        ]
+    routes: list[TelegramRoute] = []
+    seen: set[tuple[int, str]] = set()
+
+    def add(address: str, family: socket.AddressFamily) -> None:
+        if (int(family), address) in seen:
+            return
+        seen.add((int(family), address))
+        routes.append(TelegramRoute("direct", address, TELEGRAM_API_PORT, family))
+
+    if runtime.ip_family in {socket.AF_INET, socket.AF_UNSPEC}:
+        for address in runtime.fallback_ipv4s:
+            add(address, socket.AF_INET)
+    try:
+        resolved = resolve(
+            TELEGRAM_API_HOST,
+            TELEGRAM_API_PORT,
+            runtime.ip_family,
+            socket.SOCK_STREAM,
+        )
+    except OSError as exc:
+        # DNS is an external boundary: the operator's fallback addresses are
+        # exactly the route for a broken resolver, as in the bot's resolver.
+        if routes:
+            return routes
+        raise TelegramDeliveryError(
+            TELEGRAM_NO_ROUTE, f"cannot resolve {TELEGRAM_API_HOST}: {exc}"
+        ) from exc
+    for family, _socktype, _proto, _canonname, sockaddr in resolved:
+        if family not in {socket.AF_INET, socket.AF_INET6}:
+            continue
+        if runtime.ip_family != socket.AF_UNSPEC and family != runtime.ip_family:
+            continue
+        add(str(sockaddr[0]), socket.AddressFamily(family))
+    if not routes:
+        raise TelegramDeliveryError(
+            TELEGRAM_NO_ROUTE, f"no usable address for {TELEGRAM_API_HOST}"
+        )
+    return routes
+
+
+class PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS to ``api.telegram.org`` over one chosen TCP destination.
+
+    Only the TCP destination changes; the TLS handshake still sends the
+    Telegram SNI and verifies Telegram's certificate for that hostname.
+    """
+
+    def __init__(
+        self,
+        route: TelegramRoute,
+        *,
+        timeout: float,
+        tls_context: ssl.SSLContext,
+    ) -> None:
+        super().__init__(
+            TELEGRAM_API_HOST, TELEGRAM_API_PORT, timeout=timeout, context=tls_context
+        )
+        self._route = route
+        self._tls_context = tls_context
+
+    def connect(self) -> None:
+        sock = socket.socket(self._route.family, socket.SOCK_STREAM)
+        try:
+            sock.settimeout(self.timeout)
+            sock.connect((self._route.address, self._route.port))
+            self.sock = self._tls_context.wrap_socket(
+                sock, server_hostname=TELEGRAM_API_HOST
+            )
+        except BaseException:
+            sock.close()
+            raise
+
+
+def post_telegram(
+    route: TelegramRoute,
+    path: str,
+    payload: bytes,
+    *,
+    timeout: float,
+    tls_context: ssl.SSLContext,
+    connection_factory: Callable[..., http.client.HTTPSConnection] = PinnedHTTPSConnection,
+) -> tuple[int, bytes] | None:
+    """POST once; ``None`` means the connection failed before any byte was sent."""
+
+    connection = connection_factory(route, timeout=timeout, tls_context=tls_context)
+    try:
+        try:
+            connection.connect()
+        except OSError:
+            return None
+        try:
+            connection.request(
+                "POST",
+                path,
+                body=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "User-Agent": "vpnbot-xray-release-alert/1",
+                },
+            )
+            response = connection.getresponse()
+            raw = response.read(TELEGRAM_RESPONSE_LIMIT_BYTES + 1)
+            return response.status, raw
+        except (OSError, http.client.HTTPException) as exc:
+            raise TelegramDeliveryError(
+                TELEGRAM_DELIVERY_AMBIGUOUS,
+                f"request sent over {route.label()} but no complete response: "
+                f"{type(exc).__name__}",
+            ) from exc
+    finally:
+        connection.close()
 
 
 def fetch_text(url: str, timeout: int) -> str:
@@ -715,8 +1026,15 @@ def recovery_text(condition_name: str, record: dict[str, Any]) -> str:
     )
 
 
-def telegram_sender(settings: Settings, token: str) -> Callable[[str], int]:
-    endpoint = f"https://api.telegram.org/bot{token}/sendMessage"
+def telegram_sender(
+    settings: Settings,
+    runtime: BotRuntime,
+    *,
+    routes: Callable[[BotRuntime], list[TelegramRoute]] = telegram_routes,
+    post: Callable[..., tuple[int, bytes] | None] = post_telegram,
+    tls_context_factory: Callable[[], ssl.SSLContext] = ssl.create_default_context,
+) -> Callable[[str], int]:
+    path = f"/bot{runtime.token}/sendMessage"
 
     def send(text: str) -> int:
         payload = release_pipeline.canonical_json_bytes(
@@ -726,37 +1044,47 @@ def telegram_sender(settings: Settings, token: str) -> Callable[[str], int]:
                 "disable_web_page_preview": True,
             }
         )
-        request = urllib.request.Request(
-            endpoint,
-            data=payload,
-            headers={
-                "Content-Type": "application/json",
-                "User-Agent": "vpnbot-xray-release-alert/1",
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(
-                request, timeout=settings.request_timeout_seconds
-            ) as response:
-                raw = response.read()
-        except urllib.error.HTTPError as exc:
-            raise release_pipeline.PipelineError(
-                f"Telegram Bot API returned HTTP {exc.code}"
-            ) from exc
-        except urllib.error.URLError as exc:
-            raise release_pipeline.PipelineError(
-                f"Telegram Bot API request failed: {exc.reason}"
-            ) from exc
+        tls_context = tls_context_factory()
+        attempted: list[str] = []
+        answer: tuple[int, bytes] | None = None
+        for route in routes(runtime):
+            attempted.append(route.label())
+            answer = post(
+                route,
+                path,
+                payload,
+                timeout=settings.request_timeout_seconds,
+                tls_context=tls_context,
+            )
+            if answer is not None:
+                break
+        if answer is None:
+            raise TelegramDeliveryError(
+                TELEGRAM_CONNECT_FAILED,
+                "no Telegram route accepted a connection; nothing was sent: "
+                + ", ".join(attempted),
+            )
+        status, raw = answer
+        if status != 200:
+            raise TelegramDeliveryError(
+                TELEGRAM_HTTP_STATUS, f"Telegram Bot API returned HTTP {status}"
+            )
+        if len(raw) > TELEGRAM_RESPONSE_LIMIT_BYTES:
+            raise TelegramDeliveryError(
+                TELEGRAM_RESPONSE_INVALID, "Telegram Bot API response is too large"
+            )
         try:
             decoded = json.loads(raw)
             message_id = decoded["result"]["message_id"]
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
-            raise release_pipeline.PipelineError(
-                "Telegram Bot API returned an invalid response"
+            raise TelegramDeliveryError(
+                TELEGRAM_RESPONSE_INVALID,
+                "Telegram Bot API returned an invalid response",
             ) from exc
         if decoded.get("ok") is not True or not isinstance(message_id, int):
-            raise release_pipeline.PipelineError("Telegram Bot API rejected the message")
+            raise TelegramDeliveryError(
+                TELEGRAM_REJECTED, "Telegram Bot API rejected the message"
+            )
         return message_id
 
     return send
@@ -900,8 +1228,8 @@ def main() -> int:
         if args.print_status:
             print(json.dumps(status_payload(conditions), ensure_ascii=False, sort_keys=True))
             return 0
-        token = load_bot_token(settings.bot_env_file)
-        send = telegram_sender(settings, token)
+        runtime = load_bot_runtime(settings.bot_env_file)
+        send = telegram_sender(settings, runtime)
         if args.send_test:
             message_id = send(
                 "✅ Монитор автоматических выпусков Xray подключён.\n\n"

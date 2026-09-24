@@ -93,6 +93,36 @@ Telegram Bot API не предоставляет ключ идемпотентн
 интервал повтора ограничивают этот случай одним редким повтором, а обычные
 systemd-запуски полностью дедуплицируются.
 
+## Сетевой путь до Telegram
+
+На production-хосте нет IPv6-маршрута, а часть IPv4-адресов Telegram
+заблокирована: прямой `urlopen` тратил весь таймаут на мёртвый IPv4 и падал
+`ENETUNREACH` на IPv6, поэтому ни авария, ни восстановление не доставлялись.
+Наблюдатель не заводит собственной сетевой политики и не импортирует код бота:
+он читает тот же контракт, что и все процессы, владеющие ботом
+(`_BOT_IDENTITY` в `deployment/service_env_profiles.py` VPnBot), из того же
+root-only runtime-env, откуда берёт токен:
+
+- `VPNBOT_TELEGRAM_IP_FAMILY` — семейство адресов (пусто/`ipv4` по умолчанию,
+  `auto`, `ipv6`); неизвестное значение — отказ
+  `telegram_egress_config_invalid`;
+- `VPNBOT_TELEGRAM_API_FALLBACK_IPV4S` — резервные IPv4 Bot API;
+- `VPNBOT_TELEGRAM_EGRESS_HEALTH_PATH` — путь проекции relay (по умолчанию
+  `/run/vpnbot-node-manager/telegram-egress.json`, владелец — node manager).
+
+Порядок маршрутов повторяет бота (`telegram_egress.py`, `telegram_client.py`):
+свежая (не старше 45 с по `updated_at_monotonic`) проекция со здоровыми портами
+`api.telegram.org` — только эти loopback-relay; иначе резервные IPv4, затем DNS
+выбранного семейства. Меняется только TCP-адрес: TLS несёт SNI
+`api.telegram.org` и проверяет его сертификат.
+
+Следующий маршрут пробуется только если соединение не установилось (TCP или
+TLS) — запрос ещё не ушёл. Если запрос ушёл, а полного ответа нет, это
+`telegram_delivery_ambiguous`, и в этом запуске он не повторяется: у
+`sendMessage` нет ключа идемпотентности. Коды отказа: `telegram_no_route`,
+`telegram_connect_failed`, `telegram_delivery_ambiguous`,
+`telegram_http_status`, `telegram_response_invalid`, `telegram_rejected`.
+
 ## Безопасность
 
 - Токен бота не копируется в новый файл. Наблюдатель читает только
