@@ -1,20 +1,20 @@
-From 2bfd87746121ebc23c7f0af88802cbc2bcb22c5f Mon Sep 17 00:00:00 2001
+From 5a07fa10cbb9ccd90ed3c59aa9ff78d4fcc87d45 Mon Sep 17 00:00:00 2001
 From: loop-uh <loop-uh@users.noreply.github.com>
 Date: Thu, 6 Aug 2026 01:49:25 +0300
 Subject: [PATCH] Interrupt all managed Xray user sessions
 
 ---
- VPNBOT_ACTIVE_REVOKE.md                       |  44 ++-
+ VPNBOT_ACTIVE_REVOKE.md                       |  49 ++-
  core/core.go                                  |   2 +
  main/commands/all/api/api.go                  |   1 +
- .../all/api/vpnbot_live_user_audit.go         | 161 ++++++++
- .../all/api/vpnbot_live_user_audit_test.go    | 123 ++++++
+ .../all/api/vpnbot_live_user_audit.go         | 246 ++++++++++++
+ .../all/api/vpnbot_live_user_audit_test.go    | 233 ++++++++++++
  proxy/shadowsocks/active_sessions_test.go     |  71 ++++
  proxy/shadowsocks/server.go                   |  58 ++-
  proxy/vmess/inbound/active_sessions_test.go   |  80 ++++
  proxy/vmess/inbound/inbound.go                |  58 ++-
  .../managed_user_active_revoke_test.go        | 350 ++++++++++++++++++
- 10 files changed, 916 insertions(+), 32 deletions(-)
+ 10 files changed, 1116 insertions(+), 32 deletions(-)
  create mode 100644 main/commands/all/api/vpnbot_live_user_audit.go
  create mode 100644 main/commands/all/api/vpnbot_live_user_audit_test.go
  create mode 100644 proxy/shadowsocks/active_sessions_test.go
@@ -22,7 +22,7 @@ Subject: [PATCH] Interrupt all managed Xray user sessions
  create mode 100644 testing/scenarios/managed_user_active_revoke_test.go
 
 diff --git a/VPNBOT_ACTIVE_REVOKE.md b/VPNBOT_ACTIVE_REVOKE.md
-index d6b4c59..affa290 100644
+index d6b4c59..bab46a1 100644
 --- a/VPNBOT_ACTIVE_REVOKE.md
 +++ b/VPNBOT_ACTIVE_REVOKE.md
 @@ -1,23 +1,24 @@
@@ -60,7 +60,7 @@ index d6b4c59..affa290 100644
  `AddUser`/`RemoveUser` mutations share one mutex, so a connection authenticated
  before deletion cannot register after the same email has been deleted or
  replaced. `RemoveUser` deletes the validator entry before closing its captured
-@@ -31,8 +32,21 @@ user's active connection.
+@@ -31,8 +32,26 @@ user's active connection.
  
  Regression coverage lives in
  `common/active_user_sessions_test.go`,
@@ -84,6 +84,11 @@ index d6b4c59..affa290 100644
 +each list through `GetInboundUsersCount`, and repeats the complete pass. It
 +returns both passes as typed JSON so the VPnBot node helper can reject any
 +registry drift without launching a process and gRPC connection per inbound.
++Each user is written as its email and exact account identity: a VLESS account
++as `{"_TypedMessage_", "id"}` (the same values the reflective encoder emits),
++every other account type in the reflective representation. The compact
++encoding keeps a 15 000-user answer at ~4 MB instead of ~12 MB of indented
++reflection output.
 +
 +This command does not replace or weaken the active-revoke capability. It never
 +adds or removes users and never restarts Xray.
@@ -113,14 +118,15 @@ index 85d7aa9..30b7760 100644
  		cmdListRules,
 diff --git a/main/commands/all/api/vpnbot_live_user_audit.go b/main/commands/all/api/vpnbot_live_user_audit.go
 new file mode 100644
-index 0000000..2b5bd38
+index 0000000..dedbdfe
 --- /dev/null
 +++ b/main/commands/all/api/vpnbot_live_user_audit.go
-@@ -0,0 +1,161 @@
+@@ -0,0 +1,246 @@
 +package api
 +
 +import (
 +	"context"
++	"encoding/json"
 +	"fmt"
 +	"sort"
 +	"strings"
@@ -129,6 +135,7 @@ index 0000000..2b5bd38
 +	"github.com/xtls/xray-core/common/protocol"
 +	creflect "github.com/xtls/xray-core/common/reflect"
 +	"github.com/xtls/xray-core/main/commands/base"
++	"github.com/xtls/xray-core/proxy/vless"
 +)
 +
 +const vpnbotLiveUserAuditContract = "vpnbot-live-user-audit-v1"
@@ -187,11 +194,94 @@ index 0000000..2b5bd38
 +	if err != nil {
 +		base.Fatalf("vpnbot live user audit failed: %s", err)
 +	}
-+	payload, ok := creflect.MarshalToJson(result, true)
-+	if !ok {
-+		base.Fatalf("vpnbot live user audit response encoding failed")
++	payload, err := encodeVPnBotLiveUserAudit(result)
++	if err != nil {
++		base.Fatalf("vpnbot live user audit response encoding failed: %s", err)
 +	}
-+	fmt.Println(payload)
++	fmt.Println(string(payload))
++}
++
++// The audit reader needs each live user's email and exact account identity.
++// Reflective MarshalToJson of every account made the answer ~400 indented
++// bytes per user: 12 MB and ~0.4 s of CPU per call on a 15 000-user node, run
++// twice per credential creation.  A VLESS account is written directly as the
++// same {"_TypedMessage_", "id"} the reflective encoder emits for it; every
++// other account type keeps the reflective representation unchanged.
++type vpnbotLiveUserAuditUserJSON struct {
++	Email   string          `json:"email,omitempty"`
++	Account json.RawMessage `json:"account"`
++}
++
++type vpnbotLiveUserAuditInboundJSON struct {
++	Tag         string                        `json:"tag"`
++	UserManager bool                          `json:"user_manager"`
++	Users       []vpnbotLiveUserAuditUserJSON `json:"users"`
++	Count       int64                         `json:"count"`
++}
++
++type vpnbotLiveUserAuditPassJSON struct {
++	Inbounds []vpnbotLiveUserAuditInboundJSON `json:"inbounds"`
++}
++
++type vpnbotLiveUserAuditResultJSON struct {
++	Contract       string                        `json:"contract"`
++	SnapshotPasses int                           `json:"snapshot_passes"`
++	Passes         []vpnbotLiveUserAuditPassJSON `json:"passes"`
++}
++
++type vpnbotVlessAccountJSON struct {
++	Type string `json:"_TypedMessage_"`
++	ID   string `json:"id"`
++}
++
++func encodeVPnBotLiveUserAccount(user *protocol.User) (json.RawMessage, error) {
++	if user.Account == nil {
++		return json.RawMessage("null"), nil
++	}
++	if instance, err := user.Account.GetInstance(); err == nil {
++		if account, ok := instance.(*vless.Account); ok && account.Id != "" {
++			return json.Marshal(vpnbotVlessAccountJSON{Type: user.Account.Type, ID: account.Id})
++		}
++	}
++	reflected, ok := creflect.MarshalToJson(user.Account, true)
++	if !ok {
++		return json.RawMessage("null"), nil
++	}
++	return json.RawMessage(reflected), nil
++}
++
++func encodeVPnBotLiveUserAudit(result *vpnbotLiveUserAuditResult) ([]byte, error) {
++	encoded := vpnbotLiveUserAuditResultJSON{
++		Contract:       result.Contract,
++		SnapshotPasses: result.SnapshotPasses,
++		Passes:         make([]vpnbotLiveUserAuditPassJSON, 0, len(result.Passes)),
++	}
++	for _, pass := range result.Passes {
++		encodedPass := vpnbotLiveUserAuditPassJSON{
++			Inbounds: make([]vpnbotLiveUserAuditInboundJSON, 0, len(pass.Inbounds)),
++		}
++		for _, inbound := range pass.Inbounds {
++			users := make([]vpnbotLiveUserAuditUserJSON, 0, len(inbound.Users))
++			for _, user := range inbound.Users {
++				if user == nil {
++					return nil, fmt.Errorf("live inbound %q returned a nil user", inbound.Tag)
++				}
++				account, err := encodeVPnBotLiveUserAccount(user)
++				if err != nil {
++					return nil, err
++				}
++				users = append(users, vpnbotLiveUserAuditUserJSON{Email: user.Email, Account: account})
++			}
++			encodedPass.Inbounds = append(encodedPass.Inbounds, vpnbotLiveUserAuditInboundJSON{
++				Tag:         inbound.Tag,
++				UserManager: inbound.UserManager,
++				Users:       users,
++				Count:       inbound.Count,
++			})
++		}
++		encoded.Passes = append(encoded.Passes, encodedPass)
++	}
++	return json.Marshal(encoded)
 +}
 +
 +func collectVPnBotLiveUserAudit(
@@ -280,15 +370,17 @@ index 0000000..2b5bd38
 +}
 diff --git a/main/commands/all/api/vpnbot_live_user_audit_test.go b/main/commands/all/api/vpnbot_live_user_audit_test.go
 new file mode 100644
-index 0000000..3ef9062
+index 0000000..16111dc
 --- /dev/null
 +++ b/main/commands/all/api/vpnbot_live_user_audit_test.go
-@@ -0,0 +1,123 @@
+@@ -0,0 +1,233 @@
 +package api
 +
 +import (
 +	"context"
 +	"encoding/json"
++	"fmt"
++	"strconv"
 +	"testing"
 +
 +	handlerService "github.com/xtls/xray-core/app/proxyman/command"
@@ -296,7 +388,10 @@ index 0000000..3ef9062
 +	creflect "github.com/xtls/xray-core/common/reflect"
 +	"github.com/xtls/xray-core/common/serial"
 +	"github.com/xtls/xray-core/core"
++	"github.com/xtls/xray-core/proxy/shadowsocks"
++	"github.com/xtls/xray-core/proxy/trojan"
 +	"github.com/xtls/xray-core/proxy/vless"
++	"github.com/xtls/xray-core/proxy/vmess"
 +	"google.golang.org/grpc"
 +	"google.golang.org/grpc/codes"
 +	"google.golang.org/grpc/status"
@@ -383,12 +478,12 @@ index 0000000..3ef9062
 +	if err != nil {
 +		t.Fatal(err)
 +	}
-+	payload, ok := creflect.MarshalToJson(result, true)
-+	if !ok {
-+		t.Fatal("live user audit result did not marshal")
++	payload, err := encodeVPnBotLiveUserAudit(result)
++	if err != nil {
++		t.Fatal(err)
 +	}
 +	var decoded map[string]interface{}
-+	if err := json.Unmarshal([]byte(payload), &decoded); err != nil {
++	if err := json.Unmarshal(payload, &decoded); err != nil {
 +		t.Fatal(err)
 +	}
 +	passes, ok := decoded["passes"].([]interface{})
@@ -406,6 +501,111 @@ index 0000000..3ef9062
 +			t.Fatalf("typed VLESS account was not preserved: %#v", account)
 +		}
 +	}
++}
++
++func vpnbotAuditReflectedUsers(t *testing.T, users []*protocol.User) []map[string]interface{} {
++	t.Helper()
++	result := &vpnbotLiveUserAuditResult{
++		Contract:       vpnbotLiveUserAuditContract,
++		SnapshotPasses: 1,
++		Passes: []vpnbotLiveUserAuditPass{{Inbounds: []vpnbotLiveUserAuditInbound{{
++			Tag: "live", UserManager: true, Users: users, Count: int64(len(users)),
++		}}}},
++	}
++	reflected, ok := creflect.MarshalToJson(result, true)
++	if !ok {
++		t.Fatal("reflective encoding failed")
++	}
++	direct, err := encodeVPnBotLiveUserAudit(result)
++	if err != nil {
++		t.Fatal(err)
++	}
++	decode := func(raw []byte) []map[string]interface{} {
++		var decoded struct {
++			Contract string `json:"contract"`
++			Passes   []struct {
++				Inbounds []struct {
++					Tag   string                   `json:"tag"`
++					Users []map[string]interface{} `json:"users"`
++					Count int64                    `json:"count"`
++				} `json:"inbounds"`
++			} `json:"passes"`
++		}
++		if err := json.Unmarshal(raw, &decoded); err != nil {
++			t.Fatal(err)
++		}
++		if decoded.Contract != vpnbotLiveUserAuditContract || decoded.Passes[0].Inbounds[0].Count != int64(len(users)) {
++			t.Fatalf("envelope changed: %s", raw)
++		}
++		return decoded.Passes[0].Inbounds[0].Users
++	}
++	old, direct2 := decode([]byte(reflected)), decode(direct)
++	if len(old) != len(direct2) {
++		t.Fatalf("user count changed: %d != %d", len(old), len(direct2))
++	}
++	for index := range old {
++		if old[index]["email"] != direct2[index]["email"] {
++			t.Fatalf("user %d email changed: %#v != %#v", index, old[index], direct2[index])
++		}
++		oldAccount, _ := old[index]["account"].(map[string]interface{})
++		newAccount, _ := direct2[index]["account"].(map[string]interface{})
++		if oldAccount["_TypedMessage_"] == "xray.proxy.vless.Account" && oldAccount["id"] != "" && oldAccount["id"] != nil {
++			// The reader's identity: type and exact id, nothing else.
++			if newAccount["_TypedMessage_"] != oldAccount["_TypedMessage_"] || newAccount["id"] != oldAccount["id"] || len(newAccount) != 2 {
++				t.Fatalf("user %d VLESS identity changed: %#v != %#v", index, oldAccount, newAccount)
++			}
++			continue
++		}
++		oldJSON, _ := json.Marshal(oldAccount)
++		newJSON, _ := json.Marshal(newAccount)
++		if string(oldJSON) != string(newJSON) {
++			t.Fatalf("user %d non-VLESS account changed: %s != %s", index, oldJSON, newJSON)
++		}
++	}
++	return direct2
++}
++
++func TestVPnBotLiveUserAuditDirectEncodingKeepsTheReaderIdentity(t *testing.T) {
++	users := []*protocol.User{
++		{Email: "tele41_port443", Level: 1, Account: serial.ToTypedMessage(&vless.Account{
++			Id: "11111111-1111-4111-8111-111111111111", Flow: "xtls-rprx-vision", Encryption: "none",
++		})},
++		{Email: "tele42_port443", Account: serial.ToTypedMessage(&vless.Account{Id: "22222222-2222-4222-8222-222222222222"})},
++		// No id: the reflective representation is kept as it was.
++		{Email: "tele43_port443", Account: serial.ToTypedMessage(&vless.Account{Flow: "xtls-rprx-vision"})},
++		{Email: "tele44_port443", Account: serial.ToTypedMessage(&vmess.Account{Id: "44444444-4444-4444-8444-444444444444"})},
++		{Email: "tele45_port443", Account: serial.ToTypedMessage(&trojan.Account{Password: "trojan-secret"})},
++		{Email: "tele46_port443", Account: serial.ToTypedMessage(&shadowsocks.Account{Password: "ss-secret", CipherType: shadowsocks.CipherType_AES_128_GCM})},
++		{Email: "tele47_port443"},
++		{Account: serial.ToTypedMessage(&vless.Account{Id: "88888888-8888-4888-8888-888888888888"})},
++	}
++	direct := vpnbotAuditReflectedUsers(t, users)
++	if _, present := direct[0]["level"]; present {
++		t.Fatalf("VLESS user carries more than the reader identity: %#v", direct[0])
++	}
++}
++
++func TestVPnBotLiveUserAuditDirectEncodingIsCompact(t *testing.T) {
++	users := make([]*protocol.User, 0, 500)
++	for index := 0; index < 500; index++ {
++		users = append(users, &protocol.User{
++			Email: "tele" + strconv.Itoa(100000+index) + "_port443",
++			Account: serial.ToTypedMessage(&vless.Account{
++				Id: "00000000-0000-4000-8000-" + fmt.Sprintf("%012d", index), Flow: "xtls-rprx-vision", Encryption: "none",
++			}),
++		})
++	}
++	result := &vpnbotLiveUserAuditResult{Contract: vpnbotLiveUserAuditContract, SnapshotPasses: 1,
++		Passes: []vpnbotLiveUserAuditPass{{Inbounds: []vpnbotLiveUserAuditInbound{{Tag: "live", UserManager: true, Users: users, Count: 500}}}}}
++	reflected, _ := creflect.MarshalToJson(result, true)
++	direct, err := encodeVPnBotLiveUserAudit(result)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(direct)*3 > len(reflected) {
++		t.Fatalf("direct encoding is not compact: %d vs %d bytes", len(direct), len(reflected))
++	}
++	vpnbotAuditReflectedUsers(t, users)
 +}
 diff --git a/proxy/shadowsocks/active_sessions_test.go b/proxy/shadowsocks/active_sessions_test.go
 new file mode 100644
