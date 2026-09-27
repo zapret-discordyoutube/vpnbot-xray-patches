@@ -36,6 +36,14 @@ class Settings:
     state_dir: Path
     canary_script: Path
     timeout_seconds: int
+    # An optional SSH jump to the canary.  27.09.2026 the host's direct route
+    # to magnus timed out while the hub reached it through its
+    # control-plane bridges, and every candidate stopped at "reading canary
+    # Xray version".  All four fields are set together, or none.
+    jump_host: str = ""
+    jump_port: int = 0
+    jump_user: str = ""
+    jump_identity_file: Path | None = None
 
 
 def env(name: str, default: str = "") -> str:
@@ -65,6 +73,14 @@ def load_settings() -> Settings:
             env("VPNBOT_XRAY_CANARY_SCRIPT", str(script_dir / "canary_active_revoke.py"))
         ),
         timeout_seconds=max(60, int(env("VPNBOT_XRAY_PROMOTER_TIMEOUT_SECONDS", "900"))),
+        jump_host=env("VPNBOT_XRAY_CANARY_JUMP_HOST"),
+        jump_port=int(env("VPNBOT_XRAY_CANARY_JUMP_PORT", "0") or 0),
+        jump_user=env("VPNBOT_XRAY_CANARY_JUMP_USER"),
+        jump_identity_file=(
+            Path(env("VPNBOT_XRAY_CANARY_JUMP_IDENTITY_FILE"))
+            if env("VPNBOT_XRAY_CANARY_JUMP_IDENTITY_FILE")
+            else None
+        ),
     )
     if not settings.releases_url.startswith("https://"):
         raise release_pipeline.PipelineError("Forgejo releases URL must use HTTPS")
@@ -77,6 +93,34 @@ def load_settings() -> Settings:
             raise release_pipeline.PipelineError(f"invalid {label}")
     if not 1 <= settings.canary_port <= 65535:
         raise release_pipeline.PipelineError("invalid canary SSH port")
+    jump_fields = (
+        settings.jump_host,
+        settings.jump_port,
+        settings.jump_user,
+        settings.jump_identity_file,
+    )
+    if any(jump_fields):
+        if not all(jump_fields):
+            raise release_pipeline.PipelineError(
+                "a canary SSH jump needs host, port, user and identity together"
+            )
+        for label, value in {
+            "jump host": settings.jump_host,
+            "jump user": settings.jump_user,
+        }.items():
+            if not re.fullmatch(r"[A-Za-z0-9_.:-]+", value):
+                raise release_pipeline.PipelineError(f"invalid canary {label}")
+        if not 1 <= settings.jump_port <= 65535:
+            raise release_pipeline.PipelineError("invalid canary jump SSH port")
+        assert settings.jump_identity_file is not None
+        if (
+            not settings.jump_identity_file.is_file()
+            or settings.jump_identity_file.is_symlink()
+            or not re.fullmatch(r"[A-Za-z0-9_./@+-]+", str(settings.jump_identity_file))
+        ):
+            raise release_pipeline.PipelineError(
+                f"canary jump SSH identity is missing or unsafe: {settings.jump_identity_file}"
+            )
     for label, path in {
         "token file": settings.token_file,
         "SSH identity": settings.identity_file,
@@ -127,8 +171,24 @@ def ssh_base(settings: Settings) -> list[str]:
         f"UserKnownHostsFile={settings.known_hosts_file}",
         "-o",
         "ConnectTimeout=15",
+        *jump_options(settings),
         f"{settings.canary_user}@{settings.canary_host}",
     ]
+
+
+def jump_options(settings: Settings) -> list[str]:
+    """The hub's own jump shape: the canary key and host pin stay end to end."""
+
+    if not settings.jump_host:
+        return []
+    proxy = (
+        f"ssh -W %h:%p -p {settings.jump_port} -i {settings.jump_identity_file} "
+        "-o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes "
+        f"-o UserKnownHostsFile={settings.known_hosts_file} "
+        "-o ConnectTimeout=15 "
+        f"{settings.jump_user}@{settings.jump_host}"
+    )
+    return ["-o", f"ProxyCommand={proxy}"]
 
 
 def remote_command(

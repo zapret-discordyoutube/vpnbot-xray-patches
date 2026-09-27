@@ -1138,5 +1138,87 @@ class TelegramEgressContractTests(unittest.TestCase):
         )
 
 
+class CanaryJumpTests(unittest.TestCase):
+    """27.09.2026: the host's direct route to the canary timed out while the hub
+    reached it through a bridge; the promoter can take the same jump."""
+
+    def _settings(self, **jump: object) -> "pilot_and_promote.Settings":
+        return pilot_and_promote.Settings(
+            releases_url="https://forgejo.invalid/releases",
+            token_file=Path("/token"),
+            canary_node="canary",
+            canary_host="203.0.113.5",
+            canary_port=10222,
+            canary_user="root",
+            identity_file=Path("/key"),
+            known_hosts_file=Path("/known_hosts"),
+            updater_path="/usr/local/bin/vpnbot-xray-core-updater",
+            xray_path="/opt/vpnbot/xray-core/bin/xray",
+            config_dir="/opt/vpnbot/xray-core/config",
+            service_name="vpnbot-xray.service",
+            state_dir=Path("/state"),
+            canary_script=Path("/canary.py"),
+            timeout_seconds=900,
+            **jump,
+        )
+
+    def test_without_a_jump_the_command_is_unchanged(self) -> None:
+        command = pilot_and_promote.ssh_base(self._settings())
+        self.assertFalse(any("ProxyCommand" in part for part in command))
+        self.assertEqual("root@203.0.113.5", command[-1])
+
+    def test_a_jump_goes_through_the_bridge_with_pinned_hosts(self) -> None:
+        command = pilot_and_promote.ssh_base(
+            self._settings(
+                jump_host="198.51.100.7",
+                jump_port=10222,
+                jump_user="vpnbot-bridge",
+                jump_identity_file=Path("/bridge_key"),
+            )
+        )
+        self.assertEqual("root@203.0.113.5", command[-1])
+        proxy = [part for part in command if part.startswith("ProxyCommand=")]
+        self.assertEqual(
+            [
+                "ProxyCommand=ssh -W %h:%p -p 10222 -i /bridge_key -o BatchMode=yes "
+                "-o IdentitiesOnly=yes -o StrictHostKeyChecking=yes "
+                "-o UserKnownHostsFile=/known_hosts -o ConnectTimeout=15 "
+                "vpnbot-bridge@198.51.100.7"
+            ],
+            proxy,
+        )
+        self.assertIn("StrictHostKeyChecking=yes", command)
+
+    def test_a_partial_jump_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            for name in ("token", "key", "known_hosts", "canary.py"):
+                (root / name).write_text("x\n", encoding="utf-8")
+            os.chmod(root / "token", 0o600)
+            env = {
+                "VPNBOT_XRAY_FORGEJO_TOKEN_FILE": str(root / "token"),
+                "VPNBOT_XRAY_CANARY_NODE": "canary",
+                "VPNBOT_XRAY_CANARY_HOST": "203.0.113.5",
+                "VPNBOT_XRAY_CANARY_IDENTITY_FILE": str(root / "key"),
+                "VPNBOT_XRAY_CANARY_KNOWN_HOSTS_FILE": str(root / "known_hosts"),
+                "VPNBOT_XRAY_CANARY_SCRIPT": str(root / "canary.py"),
+                "VPNBOT_XRAY_CANARY_JUMP_HOST": "198.51.100.7",
+            }
+            with mock.patch.dict(os.environ, env, clear=True):
+                with self.assertRaises(release_pipeline.PipelineError) as refused:
+                    pilot_and_promote.load_settings()
+            self.assertIn("jump", str(refused.exception))
+            env.update(
+                {
+                    "VPNBOT_XRAY_CANARY_JUMP_PORT": "10222",
+                    "VPNBOT_XRAY_CANARY_JUMP_USER": "vpnbot-bridge",
+                    "VPNBOT_XRAY_CANARY_JUMP_IDENTITY_FILE": str(root / "key"),
+                }
+            )
+            with mock.patch.dict(os.environ, env, clear=True):
+                settings = pilot_and_promote.load_settings()
+            self.assertEqual("vpnbot-bridge", settings.jump_user)
+
+
 if __name__ == "__main__":
     unittest.main()
