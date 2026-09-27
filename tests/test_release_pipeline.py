@@ -1218,6 +1218,19 @@ class CanaryJumpTests(unittest.TestCase):
             with mock.patch.dict(os.environ, env, clear=True):
                 settings = pilot_and_promote.load_settings()
             self.assertEqual("vpnbot-bridge", settings.jump_user)
+            # A known_hosts path the shell would interpret is refused for a jump.
+            odd = root / "known hosts;x"
+            odd.write_text("x\n", encoding="utf-8")
+            with mock.patch.dict(
+                os.environ, {**env, "VPNBOT_XRAY_CANARY_KNOWN_HOSTS_FILE": str(odd)}, clear=True
+            ):
+                with self.assertRaises(release_pipeline.PipelineError):
+                    pilot_and_promote.load_settings()
+            with mock.patch.dict(
+                os.environ, {**env, "VPNBOT_XRAY_CANARY_JUMP_PORT": "ssh"}, clear=True
+            ):
+                with self.assertRaises(release_pipeline.PipelineError):
+                    pilot_and_promote.load_settings()
 
 
 if __name__ == "__main__":

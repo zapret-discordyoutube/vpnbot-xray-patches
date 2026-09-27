@@ -50,6 +50,13 @@ def env(name: str, default: str = "") -> str:
     return str(os.environ.get(name, default)).strip()
 
 
+def _int_setting(name: str) -> int:
+    raw = env(name, "0") or "0"
+    if not raw.isdigit():
+        raise release_pipeline.PipelineError(f"{name} must be a number")
+    return int(raw)
+
+
 def load_settings() -> Settings:
     script_dir = Path(__file__).resolve().parent
     settings = Settings(
@@ -74,7 +81,7 @@ def load_settings() -> Settings:
         ),
         timeout_seconds=max(60, int(env("VPNBOT_XRAY_PROMOTER_TIMEOUT_SECONDS", "900"))),
         jump_host=env("VPNBOT_XRAY_CANARY_JUMP_HOST"),
-        jump_port=int(env("VPNBOT_XRAY_CANARY_JUMP_PORT", "0") or 0),
+        jump_port=_int_setting("VPNBOT_XRAY_CANARY_JUMP_PORT"),
         jump_user=env("VPNBOT_XRAY_CANARY_JUMP_USER"),
         jump_identity_file=(
             Path(env("VPNBOT_XRAY_CANARY_JUMP_IDENTITY_FILE"))
@@ -112,6 +119,12 @@ def load_settings() -> Settings:
                 raise release_pipeline.PipelineError(f"invalid canary {label}")
         if not 1 <= settings.jump_port <= 65535:
             raise release_pipeline.PipelineError("invalid canary jump SSH port")
+        # ssh runs ProxyCommand through the shell and expands %-tokens in it:
+        # every value placed there is a plain path or name, never quoted text.
+        if not re.fullmatch(r"[A-Za-z0-9_./@+-]+", str(settings.known_hosts_file)):
+            raise release_pipeline.PipelineError(
+                f"canary known_hosts path is unsafe for a jump: {settings.known_hosts_file}"
+            )
         assert settings.jump_identity_file is not None
         if (
             not settings.jump_identity_file.is_file()
