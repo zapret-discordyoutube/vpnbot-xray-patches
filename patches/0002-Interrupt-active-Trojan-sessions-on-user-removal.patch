@@ -471,7 +471,7 @@ index d5979e52..ef8cca9d 100644
 +		return current != nil && current.Account != nil && current.Account.Equals(user.Account)
 +	})
 +	if err != nil {
-+		return errors.New("Trojan user was removed while the connection was authenticating").Base(err).AtInfo()
++		return errors.New("Trojan user was removed while the connection was authenticating").Base(err)
 +	}
 +	defer unregisterSession()
 +
@@ -518,7 +518,7 @@ index 010e755f..8f0690f3 100644
 -	h.activeSessionsMu.Lock()
 -	defer h.activeSessionsMu.Unlock()
 -	if h.activeSessionsClosed {
--		return errors.New("VLESS inbound is closed").AtInfo()
+-		return errors.New("VLESS inbound is closed")
 -	}
 -	return h.validator.Add(u)
 +	return h.activeSessions.MutateIfOpen(func() error {
@@ -560,12 +560,12 @@ index 010e755f..8f0690f3 100644
 -	h.activeSessionsMu.Lock()
 -	if h.activeSessionsClosed {
 -		h.activeSessionsMu.Unlock()
--		return nil, errors.New("VLESS inbound is closed").AtInfo()
+-		return nil, errors.New("VLESS inbound is closed")
 -	}
 -	current := h.validator.GetByEmail(email)
 -	if current == nil || current.Account == nil || !current.Account.Equals(user.Account) {
 -		h.activeSessionsMu.Unlock()
--		return nil, errors.New("VLESS user was removed while the connection was authenticating").AtInfo()
+-		return nil, errors.New("VLESS user was removed while the connection was authenticating")
 -	}
 -	if h.activeSessions == nil {
 -		h.activeSessions = make(map[string]map[uint64]common.Closable)

@@ -764,7 +764,7 @@ index 360ea38..83a52ef 100644
 +				})
 +				if err != nil {
 +					data.Release()
-+					return errors.New("Shadowsocks user was removed while the UDP session was authenticating").Base(err).AtInfo()
++					return errors.New("Shadowsocks user was removed while the UDP session was authenticating").Base(err)
 +				}
 +			}
  
@@ -779,7 +779,7 @@ index 360ea38..83a52ef 100644
 +		return current != nil && current.Account != nil && current.Account.Equals(request.User.Account)
 +	})
 +	if err != nil {
-+		return errors.New("Shadowsocks user was removed while the connection was authenticating").Base(err).AtInfo()
++		return errors.New("Shadowsocks user was removed while the connection was authenticating").Base(err)
 +	}
 +	defer unregisterSession()
  	conn.SetReadDeadline(time.Time{})
@@ -968,7 +968,7 @@ index e084a88..89cc2a5 100644
 +		return current != nil && current.Account != nil && current.Account.Equals(request.User.Account)
 +	})
 +	if err != nil {
-+		return errors.New("VMess user was removed while the connection was authenticating").Base(err).AtInfo()
++		return errors.New("VMess user was removed while the connection was authenticating").Base(err)
 +	}
 +	defer unregisterSession()
 +
