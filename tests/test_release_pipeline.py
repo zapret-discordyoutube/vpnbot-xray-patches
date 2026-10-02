@@ -778,6 +778,58 @@ class ReleasePipelineTests(unittest.TestCase):
 TOKEN = "123456789:" + "A" * 35
 
 
+class PatchCiWatchTests(unittest.TestCase):
+    """ci.yml red since 01.10.2026 went unnoticed: only candidate.yml was watched."""
+
+    @staticmethod
+    def workflow_run(run_id: int, workflow: str, status: str) -> dict[str, object]:
+        return {
+            "id": run_id,
+            "workflow_id": workflow,
+            "prettyref": "main",
+            "status": status,
+            "title": "Patch",
+            "html_url": f"https://forgejo.invalid/runs/{run_id}",
+            "created_at": "2026-10-03T00:00:00Z",
+        }
+
+    def test_red_ci_is_its_own_problem_while_candidate_is_green(self) -> None:
+        runs = [self.workflow_run(5384, "candidate.yml", "success"), self.workflow_run(5385, "ci.yml", "failure")]
+        candidate = release_alert_monitor.evaluate_patch_pipeline(runs, "candidate.yml")
+        ci = release_alert_monitor.evaluate_patch_pipeline(
+            runs, "ci.yml", watch=release_alert_monitor.PATCH_CI_WATCH
+        )
+        self.assertEqual((candidate.name, candidate.status), ("patch_pipeline", "healthy"))
+        self.assertEqual((ci.name, ci.status), ("patch_ci", "problem"))
+        self.assertEqual(ci.signature, "run:5385:failure")
+        self.assertIn("XTLS", ci.detail)
+
+    def test_green_ci_recovers(self) -> None:
+        runs = [self.workflow_run(5385, "ci.yml", "failure"), self.workflow_run(5390, "ci.yml", "success")]
+        ci = release_alert_monitor.evaluate_patch_pipeline(
+            runs, "ci.yml", watch=release_alert_monitor.PATCH_CI_WATCH
+        )
+        self.assertEqual(ci.status, "healthy")
+        self.assertIn("снова зелёная", release_alert_monitor.recovery_text("patch_ci", {}))
+
+    def test_collect_conditions_watches_both_workflows(self) -> None:
+        runs = [self.workflow_run(5384, "candidate.yml", "success"), self.workflow_run(5385, "ci.yml", "failure")]
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            settings = ReleasePipelineTests.alert_settings(Path(raw_tmp))
+            (Path(raw_tmp) / "promoter").mkdir()
+            with (
+                mock.patch.object(release_alert_monitor, "fetch_actions", return_value=runs) as fetch,
+                mock.patch.object(release_pipeline, "list_forgejo_releases", return_value=[]),
+            ):
+                conditions = release_alert_monitor.collect_conditions(settings, 1_790_000_000)
+        self.assertEqual(
+            [call.args[2] for call in fetch.call_args_list], ["candidate.yml", "ci.yml"]
+        )
+        by_name = {condition.name: condition.status for condition in conditions}
+        self.assertEqual(by_name["patch_ci"], "problem")
+        self.assertEqual(by_name["patch_pipeline"], "healthy")
+
+
 class SourceUnavailabilityTests(unittest.TestCase):
     """Forgejo stops ~90 s nightly for its backup; that is not a release verdict."""
 

@@ -40,11 +40,18 @@ PENDING_WORKFLOW_STATES = {
 }
 PROMOTER_PENDING_PHASES = {"installing", "installed", "pilot_passed", "promoted"}
 PROMOTER_FAILED_PHASES = {"failed_rolled_back", "failed_rollback_failed"}
-CONDITION_NAMES = ("patch_pipeline", "candidate_stalled", "canary_failed", "release_source")
+CONDITION_NAMES = (
+    "patch_pipeline",
+    "patch_ci",
+    "candidate_stalled",
+    "canary_failed",
+    "release_source",
+)
 ALERT_ENV_NAMES = {
     "VPNBOT_XRAY_ALERT_ACTIONS_URL",
     "VPNBOT_XRAY_ALERT_RELEASES_URL",
     "VPNBOT_XRAY_ALERT_WORKFLOW_ID",
+    "VPNBOT_XRAY_ALERT_CI_WORKFLOW_ID",
     "VPNBOT_XRAY_ALERT_BOT_ENV_FILE",
     "VPNBOT_XRAY_ALERT_CHAT_ID",
     "VPNBOT_XRAY_ALERT_PROMOTER_STATE_DIR",
@@ -109,6 +116,11 @@ class Settings:
     request_timeout_seconds: int
     # Forgejo planned stops last ~90 s; only a longer silence is an incident.
     source_outage_seconds: int = 1800
+    # The patch CI (official XTLS head + patches + tests) runs beside the
+    # candidate workflow; red there means the next official release will not
+    # build, days before candidate.yml would say so (ci.yml red since 01.10.2026
+    # went unnoticed because only candidate.yml was watched).
+    ci_workflow_id: str = "ci.yml"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -159,6 +171,7 @@ def load_settings() -> Settings:
             "zapretkvn/vpnbot-xray-patches/releases",
         ),
         workflow_id=env("VPNBOT_XRAY_ALERT_WORKFLOW_ID", "candidate.yml"),
+        ci_workflow_id=env("VPNBOT_XRAY_ALERT_CI_WORKFLOW_ID", "ci.yml"),
         bot_env_file=Path(
             env(
                 "VPNBOT_XRAY_ALERT_BOT_ENV_FILE",
@@ -196,8 +209,9 @@ def load_settings() -> Settings:
     }.items():
         if not url.startswith("https://"):
             raise release_pipeline.PipelineError(f"{label} must use HTTPS")
-    if not re.fullmatch(r"[A-Za-z0-9_.-]+\.ya?ml", settings.workflow_id):
-        raise release_pipeline.PipelineError("invalid monitored workflow id")
+    for workflow in (settings.workflow_id, settings.ci_workflow_id):
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+\.ya?ml", workflow):
+            raise release_pipeline.PipelineError("invalid monitored workflow id")
     if not re.fullmatch(r"-?[1-9][0-9]*", settings.chat_id):
         raise release_pipeline.PipelineError("invalid Telegram chat id")
     for label, path in {
@@ -475,12 +489,47 @@ def fetch_actions(
     return fetch_actions_html(url, workflow_id, timeout)
 
 
+@dataclasses.dataclass(frozen=True)
+class WorkflowWatch:
+    """One watched workflow: its condition and what a failure means."""
+
+    name: str
+    headline: str
+    consequence: str
+    action: str
+
+
+PATCH_PIPELINE_WATCH = WorkflowWatch(
+    name="patch_pipeline",
+    headline="Автоматический выпуск Xray остановился в Forgejo",
+    consequence="Новый candidate и proven безопасно не выпускаются.",
+    action=(
+        "Открой запуск и проверь первый упавший шаг. Если конфликтуют патчи, "
+        "адаптируй их к новому официальному Xray и повторно запусти workflow."
+    ),
+)
+PATCH_CI_WATCH = WorkflowWatch(
+    name="patch_ci",
+    headline="Проверка патчей Xray на свежем официальном исходнике красная",
+    consequence=(
+        "Следующий официальный релиз XTLS не соберётся в candidate, пока "
+        "патчи не адаптированы."
+    ),
+    action=(
+        "Открой запуск и проверь первый упавший шаг (обычно патч не "
+        "накладывается на свежий XTLS). Адаптируй патч в существующем файле "
+        "патча и запушь — CI перезапустится сам."
+    ),
+)
+
+
 def evaluate_patch_pipeline(
     runs: list[dict[str, Any]],
     workflow_id: str,
     *,
     now_epoch: int | None = None,
     stall_seconds: int = 7200,
+    watch: WorkflowWatch = PATCH_PIPELINE_WATCH,
 ) -> Condition:
     relevant = [
         run
@@ -499,7 +548,7 @@ def evaluate_patch_pipeline(
     title = str(latest.get("title") or "").strip() or "без названия"
     link = str(latest.get("html_url") or "").strip()
     if status == "success":
-        return Condition(name="patch_pipeline", status="healthy")
+        return Condition(name=watch.name, status="healthy")
     if status in PENDING_WORKFLOW_STATES:
         created_at = latest.get("created_at")
         if created_at and now_epoch is not None:
@@ -510,7 +559,7 @@ def evaluate_patch_pipeline(
             if now_epoch - created_epoch >= stall_seconds:
                 age_minutes = max(0, (now_epoch - created_epoch) // 60)
                 return Condition(
-                    name="patch_pipeline",
+                    name=watch.name,
                     status="problem",
                     signature=f"run:{run_id}:stalled:{status}",
                     headline="Forgejo Actions не начал или не завершил выпуск Xray",
@@ -524,24 +573,21 @@ def evaluate_patch_pipeline(
                     ),
                     url=link,
                 )
-        return Condition(name="patch_pipeline", status="pending")
+        return Condition(name=watch.name, status="pending")
     if status not in FAILED_WORKFLOW_STATES:
         raise release_pipeline.PipelineError(
             f"unknown Forgejo Actions status for run {run_id}: {status or '<empty>'}"
         )
     return Condition(
-        name="patch_pipeline",
+        name=watch.name,
         status="problem",
         signature=f"run:{run_id}:{status}",
-        headline="Автоматический выпуск Xray остановился в Forgejo",
+        headline=watch.headline,
         detail=(
             f"Workflow {workflow_id}, запуск {run_id}, результат: {status}. "
-            f"Commit/запуск: {title}. Новый candidate и proven безопасно не выпускаются."
+            f"Commit/запуск: {title}. {watch.consequence}"
         ),
-        action=(
-            "Открой запуск и проверь первый упавший шаг. Если конфликтуют патчи, "
-            "адаптируй их к новому официальному Xray и повторно запусти workflow."
-        ),
+        action=watch.action,
         url=link,
     )
 
@@ -716,6 +762,11 @@ def collect_conditions(settings: Settings, now_epoch: int) -> list[Condition]:
         settings.request_timeout_seconds,
         settings.workflow_id,
     )
+    ci_runs = fetch_actions(
+        settings.actions_url,
+        settings.request_timeout_seconds,
+        settings.ci_workflow_id,
+    )
     releases = release_pipeline.list_forgejo_releases(settings.releases_url)
     candidates = unproven_candidates(releases)
     states = load_promoter_states(settings.promoter_state_dir)
@@ -725,6 +776,13 @@ def collect_conditions(settings: Settings, now_epoch: int) -> list[Condition]:
             settings.workflow_id,
             now_epoch=now_epoch,
             stall_seconds=settings.stall_seconds,
+        ),
+        evaluate_patch_pipeline(
+            ci_runs,
+            settings.ci_workflow_id,
+            now_epoch=now_epoch,
+            stall_seconds=settings.stall_seconds,
+            watch=PATCH_CI_WATCH,
         ),
         evaluate_candidate_stall(candidates, now_epoch, settings.stall_seconds),
         evaluate_canary(candidates, states),
@@ -830,6 +888,7 @@ def alert_text(condition: Condition, kind: str) -> str:
 def recovery_text(condition_name: str, record: dict[str, Any]) -> str:
     names = {
         "patch_pipeline": "Forgejo workflow снова завершился успешно",
+        "patch_ci": "проверка патчей на свежем XTLS снова зелёная",
         "candidate_stalled": "задержавшийся candidate получил proven",
         "canary_failed": "canary-контур снова подтвердил исправный выпуск",
         "release_source": "Forgejo снова отвечает монитору выпусков",
