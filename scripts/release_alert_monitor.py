@@ -42,7 +42,7 @@ PENDING_WORKFLOW_STATES = {
 }
 PROMOTER_PENDING_PHASES = {"installing", "installed", "pilot_passed", "promoted"}
 PROMOTER_FAILED_PHASES = {"failed_rolled_back", "failed_rollback_failed"}
-CONDITION_NAMES = ("patch_pipeline", "candidate_stalled", "canary_failed")
+CONDITION_NAMES = ("patch_pipeline", "candidate_stalled", "canary_failed", "release_source")
 ALERT_ENV_NAMES = {
     "VPNBOT_XRAY_ALERT_ACTIONS_URL",
     "VPNBOT_XRAY_ALERT_RELEASES_URL",
@@ -55,6 +55,7 @@ ALERT_ENV_NAMES = {
     "VPNBOT_XRAY_ALERT_REMINDER_SECONDS",
     "VPNBOT_XRAY_ALERT_RETRY_SECONDS",
     "VPNBOT_XRAY_ALERT_REQUEST_TIMEOUT_SECONDS",
+    "VPNBOT_XRAY_ALERT_SOURCE_OUTAGE_SECONDS",
 }
 
 # Telegram egress contract of the VPnBot host.  Every process that owns the bot
@@ -143,6 +144,8 @@ class Settings:
     reminder_seconds: int
     retry_seconds: int
     request_timeout_seconds: int
+    # Forgejo planned stops last ~90 s; only a longer silence is an incident.
+    source_outage_seconds: int = 1800
 
 
 @dataclasses.dataclass(frozen=True)
@@ -219,6 +222,9 @@ def load_settings() -> Settings:
         retry_seconds=positive_seconds("VPNBOT_XRAY_ALERT_RETRY_SECONDS", 900, 60),
         request_timeout_seconds=positive_seconds(
             "VPNBOT_XRAY_ALERT_REQUEST_TIMEOUT_SECONDS", 20, 5
+        ),
+        source_outage_seconds=positive_seconds(
+            "VPNBOT_XRAY_ALERT_SOURCE_OUTAGE_SECONDS", 1800, 300
         ),
     )
     for label, url in {
@@ -569,21 +575,8 @@ def post_telegram(
 
 
 def fetch_text(url: str, timeout: int) -> str:
-    request = urllib.request.Request(
-        url,
-        headers={"Accept": "text/html", "User-Agent": "vpnbot-xray-release-alert/1"},
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            raw = response.read(2 * 1024 * 1024 + 1)
-    except urllib.error.HTTPError as exc:
-        raise release_pipeline.PipelineError(
-            f"Forgejo Actions page returned HTTP {exc.code}"
-        ) from exc
-    except urllib.error.URLError as exc:
-        raise release_pipeline.PipelineError(
-            f"Forgejo Actions page request failed: {exc.reason}"
-        ) from exc
+    # One HTTP owner classifies an absent source the same way for every read.
+    raw = release_pipeline.request_bytes(url, accept="text/html", timeout=timeout)
     if len(raw) > 2 * 1024 * 1024:
         raise release_pipeline.PipelineError("Forgejo Actions page is too large")
     try:
@@ -965,6 +958,56 @@ def collect_conditions(settings: Settings, now_epoch: int) -> list[Condition]:
     ]
 
 
+@dataclasses.dataclass(frozen=True)
+class Observation:
+    """One read of every release source, or the reason none was judged."""
+
+    conditions: list[Condition]
+    source_error: release_pipeline.SourceUnavailableError | None = None
+
+
+def observe(settings: Settings, now_epoch: int) -> Observation:
+    """Read the sources; an absent source leaves every verdict unjudged.
+
+    Release conditions are not evaluated from a partial read: a 502 must not
+    resolve an open incident or open a new one.  Only ``release_source``
+    speaks for that run.
+    """
+
+    try:
+        return Observation(collect_conditions(settings, now_epoch))
+    except release_pipeline.SourceUnavailableError as exc:
+        return Observation([], exc)
+
+
+def evaluate_release_source(
+    error: release_pipeline.SourceUnavailableError | None,
+    unavailable_since: int | None,
+    now_epoch: int,
+    outage_seconds: int,
+) -> Condition:
+    if error is None or unavailable_since is None:
+        return Condition(name="release_source", status="healthy")
+    if now_epoch - unavailable_since < outage_seconds:
+        return Condition(name="release_source", status="pending")
+    return Condition(
+        name="release_source",
+        status="problem",
+        signature=f"{error.code}:{unavailable_since}",
+        headline="монитор выпусков не может прочитать Forgejo",
+        detail=(
+            f"Источник выпусков недоступен с {utc_now(unavailable_since)} "
+            f"({error.code}): {bounded_error(str(error))}. Пока он молчит, "
+            "промоутер откладывает пилот, а состояние workflow, candidate и "
+            "canary не проверяется."
+        ),
+        action=(
+            "Проверить git.zapret.moe: CT Forgejo, nginx и сеть хоста. "
+            "Плановая остановка на бэкап длится около 90 секунд."
+        ),
+    )
+
+
 def new_state() -> dict[str, Any]:
     return {"schema_version": STATE_SCHEMA_VERSION, "conditions": {}}
 
@@ -1016,6 +1059,7 @@ def recovery_text(condition_name: str, record: dict[str, Any]) -> str:
         "patch_pipeline": "Forgejo workflow снова завершился успешно",
         "candidate_stalled": "задержавшийся candidate получил proven",
         "canary_failed": "canary-контур снова подтвердил исправный выпуск",
+        "release_source": "Forgejo снова отвечает монитору выпусков",
     }
     previous = str(record.get("headline") or condition_name)
     return (
@@ -1174,6 +1218,7 @@ def reconcile(
     conditions: list[Condition],
     send: Callable[[str], int],
     now_epoch: int,
+    source_error: release_pipeline.SourceUnavailableError | None = None,
 ) -> dict[str, Any]:
     settings.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     if settings.state_dir.is_symlink():
@@ -1181,7 +1226,18 @@ def reconcile(
     settings.state_dir.chmod(0o700)
     path = settings.state_dir / "state.json"
     state = load_state(path)
-    for condition in conditions:
+    source_record = state["conditions"].setdefault("release_source", {"active": False})
+    if source_error is None:
+        source_record.pop("unavailable_since_epoch", None)
+    else:
+        source_record.setdefault("unavailable_since_epoch", now_epoch)
+    source = evaluate_release_source(
+        source_error,
+        source_record.get("unavailable_since_epoch"),
+        now_epoch,
+        settings.source_outage_seconds,
+    )
+    for condition in [*conditions, source]:
         reconcile_condition(condition, state, path, send, settings, now_epoch)
     state["last_successful_check_at"] = utc_now(now_epoch)
     write_state(path, state)
@@ -1224,9 +1280,16 @@ def main() -> int:
         load_alert_environment()
         settings = load_settings()
         now_epoch = int(time.time())
-        conditions = collect_conditions(settings, now_epoch)
+        observation = observe(settings, now_epoch)
         if args.print_status:
-            print(json.dumps(status_payload(conditions), ensure_ascii=False, sort_keys=True))
+            payload = status_payload(observation.conditions)
+            if observation.source_error is not None:
+                payload["release_source"] = {
+                    "status": "unavailable",
+                    "signature": observation.source_error.code,
+                    "headline": str(observation.source_error),
+                }
+            print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
             return 0
         runtime = load_bot_runtime(settings.bot_env_file)
         send = telegram_sender(settings, runtime)
@@ -1243,15 +1306,25 @@ def main() -> int:
         settings.state_dir.chmod(0o700)
         lock_path = settings.state_dir / "monitor.lock"
         with monitor_lock(lock_path):
-            state = reconcile(settings, conditions, send, now_epoch)
+            state = reconcile(
+                settings,
+                observation.conditions,
+                send,
+                now_epoch,
+                observation.source_error,
+            )
         active = sorted(
             name
             for name, record in state["conditions"].items()
             if record.get("active")
         )
+        source = (
+            "" if observation.source_error is None
+            else f" source_unavailable={observation.source_error.code}"
+        )
         print(
             "Xray release alert check completed: "
-            f"active={','.join(active) if active else 'none'}"
+            f"active={','.join(active) if active else 'none'}{source}"
         )
         return 0
     except BlockingIOError:

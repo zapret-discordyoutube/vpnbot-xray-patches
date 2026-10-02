@@ -778,6 +778,142 @@ class ReleasePipelineTests(unittest.TestCase):
 TOKEN = "123456789:" + "A" * 35
 
 
+class SourceUnavailabilityTests(unittest.TestCase):
+    """Forgejo stops ~90 s nightly for its backup; that is not a release verdict."""
+
+    @staticmethod
+    def http_error(code: int) -> Exception:
+        return release_pipeline.urllib.error.HTTPError(
+            "https://forgejo.invalid/x", code, "status", {}, None
+        )
+
+    def test_server_errors_and_rate_limit_are_typed_source_unavailability(self) -> None:
+        for status, code in (
+            (502, release_pipeline.SOURCE_SERVER_ERROR),
+            (503, release_pipeline.SOURCE_SERVER_ERROR),
+            (429, release_pipeline.SOURCE_RATE_LIMITED),
+        ):
+            with (
+                mock.patch.object(
+                    release_pipeline.urllib.request, "urlopen", side_effect=self.http_error(status)
+                ),
+                self.assertRaises(release_pipeline.SourceUnavailableError) as raised,
+            ):
+                release_pipeline.request_bytes("https://forgejo.invalid/x")
+            self.assertEqual(raised.exception.code, code)
+
+    def test_client_error_stays_a_contract_failure(self) -> None:
+        error = self.http_error(404)
+        error.read = lambda _size=-1: b"not found"
+        with (
+            mock.patch.object(release_pipeline.urllib.request, "urlopen", side_effect=error),
+            self.assertRaises(release_pipeline.PipelineError) as raised,
+        ):
+            release_pipeline.request_bytes("https://forgejo.invalid/x")
+        self.assertNotIsInstance(raised.exception, release_pipeline.SourceUnavailableError)
+
+    def test_exhausted_transport_retries_are_unreachable(self) -> None:
+        with (
+            mock.patch.object(
+                release_pipeline.urllib.request,
+                "urlopen",
+                side_effect=release_pipeline.urllib.error.URLError("refused"),
+            ),
+            mock.patch.object(release_pipeline.time, "sleep"),
+            self.assertRaises(release_pipeline.SourceUnavailableError) as raised,
+        ):
+            release_pipeline.request_bytes("https://forgejo.invalid/x")
+        self.assertEqual(raised.exception.code, release_pipeline.SOURCE_UNREACHABLE)
+
+    def test_observe_judges_nothing_while_the_source_is_absent(self) -> None:
+        error = release_pipeline.SourceUnavailableError(
+            release_pipeline.SOURCE_SERVER_ERROR, "HTTP 502"
+        )
+        with mock.patch.object(release_alert_monitor, "collect_conditions", side_effect=error):
+            observation = release_alert_monitor.observe(mock.sentinel.settings, 1_000)
+        self.assertEqual(observation.conditions, [])
+        self.assertIs(observation.source_error, error)
+
+    def test_planned_stop_is_silent_and_a_long_outage_alerts_once_then_recovers(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            settings = ReleasePipelineTests.alert_settings(Path(raw_tmp))
+            sent: list[str] = []
+
+            def sender(text: str) -> int:
+                sent.append(text)
+                return len(sent)
+
+            error = release_pipeline.SourceUnavailableError(
+                release_pipeline.SOURCE_SERVER_ERROR, "HTTP 502 for https://forgejo.invalid/x"
+            )
+            reconcile = release_alert_monitor.reconcile
+            # 2026-09-28 03:26: one 502 inside the ~90 s backup stop.
+            reconcile(settings, [], sender, 10_000, error)
+            reconcile(settings, [], sender, 10_090)
+            self.assertEqual(sent, [])
+
+            start = 20_000
+            for offset in range(0, 1_800 + 1, 300):
+                reconcile(settings, [], sender, start + offset, error)
+            self.assertEqual(len(sent), 1)
+            self.assertIn("не может прочитать Forgejo", sent[0])
+            self.assertIn(release_pipeline.SOURCE_SERVER_ERROR, sent[0])
+            reconcile(settings, [], sender, start + 2_400, error)
+            self.assertEqual(len(sent), 1)
+
+            reconcile(settings, [], sender, start + 3_000)
+            self.assertEqual(len(sent), 2)
+            self.assertIn("Forgejo снова отвечает", sent[1])
+            state = json.loads((settings.state_dir / "state.json").read_text())
+            self.assertNotIn("unavailable_since_epoch", state["conditions"]["release_source"])
+
+    def test_outage_neither_resolves_nor_reopens_other_incidents(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            settings = ReleasePipelineTests.alert_settings(Path(raw_tmp))
+            sent: list[str] = []
+            problem = release_alert_monitor.Condition(
+                name="canary_failed",
+                status="problem",
+                signature="candidate:failed",
+                headline="Canary failed",
+                detail="diagnostic",
+                action="inspect",
+            )
+            release_alert_monitor.reconcile(settings, [problem], sent.append, 1_000)
+            error = release_pipeline.SourceUnavailableError(
+                release_pipeline.SOURCE_UNREACHABLE, "request failed"
+            )
+            release_alert_monitor.reconcile(settings, [], sent.append, 2_000, error)
+            state = json.loads((settings.state_dir / "state.json").read_text())
+            self.assertTrue(state["conditions"]["canary_failed"]["active"])
+            self.assertEqual(len(sent), 1)
+
+    def test_state_written_by_the_previous_release_still_loads(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            path = Path(raw_tmp) / "state.json"
+            path.write_text(json.dumps({
+                "schema_version": 1,
+                "conditions": {"patch_pipeline": {"active": False}},
+            }))
+            os.chmod(path, 0o600)
+            self.assertIn("patch_pipeline", release_alert_monitor.load_state(path)["conditions"])
+
+    def test_promoter_defers_when_the_source_is_absent_before_any_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            settings = mock.Mock(state_dir=Path(raw_tmp) / "promoter", token_file=Path(raw_tmp))
+            error = release_pipeline.SourceUnavailableError(
+                release_pipeline.SOURCE_SERVER_ERROR, "HTTP 502"
+            )
+            with (
+                mock.patch.object(pilot_and_promote, "load_settings", return_value=settings),
+                mock.patch.object(pilot_and_promote, "load_token", return_value="token"),
+                mock.patch.object(pilot_and_promote, "select_candidate", side_effect=error),
+                mock.patch.object(pilot_and_promote, "process_candidate") as process,
+            ):
+                self.assertEqual(pilot_and_promote.main(), 0)
+            process.assert_not_called()
+
+
 class TelegramEgressContractTests(unittest.TestCase):
     """The observer reaches Telegram through the host egress contract."""
 

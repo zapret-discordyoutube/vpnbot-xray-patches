@@ -98,6 +98,28 @@ class PipelineError(RuntimeError):
     """A fail-closed release pipeline error."""
 
 
+SOURCE_SERVER_ERROR = "source_server_error"
+SOURCE_RATE_LIMITED = "source_rate_limited"
+SOURCE_UNREACHABLE = "source_unreachable"
+
+
+class SourceUnavailableError(PipelineError):
+    """The release source did not answer; its content was never judged.
+
+    Forgejo stops for ~90 s every night while its backup takes the consistent
+    snapshot (28-29.09.2026: HTTP 502 failed both the observer and the
+    promoter units).  A 5xx, a 429 or a transport failure says nothing about
+    releases, so callers that have not mutated anything defer to their next
+    timer run, and the observer alone escalates an outage that persists.  A
+    4xx or a malformed body stays a plain ``PipelineError``: that is a broken
+    contract, not an absent source.
+    """
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
 def sha256_bytes(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
@@ -150,12 +172,17 @@ def request_bytes(
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 return response.read()
         except urllib.error.HTTPError as exc:
+            if exc.code >= 500 or exc.code == 429:
+                code = SOURCE_RATE_LIMITED if exc.code == 429 else SOURCE_SERVER_ERROR
+                raise SourceUnavailableError(code, f"HTTP {exc.code} for {url}") from exc
             detail = exc.read(4096).decode("utf-8", errors="replace")
             raise PipelineError(f"HTTP {exc.code} for {url}: {detail}") from exc
         except (urllib.error.URLError, http.client.RemoteDisconnected, TimeoutError) as exc:
             if attempt == attempts:
                 reason = exc.reason if isinstance(exc, urllib.error.URLError) else str(exc)
-                raise PipelineError(f"request failed for {url}: {reason}") from exc
+                raise SourceUnavailableError(
+                    SOURCE_UNREACHABLE, f"request failed for {url}: {reason}"
+                ) from exc
             time.sleep(0.5 * attempt)
     raise AssertionError("unreachable request retry state")
 

@@ -536,7 +536,13 @@ def main() -> int:
         with lock_path.open("w", encoding="utf-8") as lock:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             token = load_token(settings.token_file)
-            selected = select_candidate(settings, token)
+            try:
+                selected = select_candidate(settings, token)
+            except release_pipeline.SourceUnavailableError as exc:
+                # Nothing was mutated yet: the next timer run reads again, and
+                # the release observer alone escalates a persistent outage.
+                print(f"Promoter run deferred: source_unavailable={exc.code}: {exc}")
+                return 0
             if selected is None:
                 print("No unproven VPnBot Xray candidate is waiting")
                 return 0
