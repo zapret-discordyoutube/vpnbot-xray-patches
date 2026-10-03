@@ -408,6 +408,27 @@ class ReleasePipelineTests(unittest.TestCase):
         self.assertIn("build_target Xray-linux-64-v3.zip amd64 \"\" v3", source)
         self.assertIn('go_environment+=("GOAMD64=${goamd64}")', source)
 
+    def test_every_workflow_builds_the_discovered_official_source(self) -> None:
+        # ci.yml once tested the patches against the manual upstream.env pin:
+        # after the patches moved to v26.9.30 the stale v26.7.28 pin made CI
+        # red although the release train itself was healthy.
+        for workflow in ("ci.yml", "candidate.yml"):
+            with self.subTest(workflow=workflow):
+                source = (ROOT / ".forgejo" / "workflows" / workflow).read_text(
+                    encoding="utf-8"
+                )
+
+                self.assertIn("scripts/release_pipeline.py discover", source)
+                self.assertIn(
+                    "go-version: ${{ steps.discover.outputs.go_version }}", source
+                )
+                for script in (
+                    "run: scripts/test-patches.sh",
+                    "scripts/build-release.sh release-assets",
+                ):
+                    step = source[: source.index(script)].rsplit("- name:", 1)[1]
+                    self.assertIn("VPNBOT_BUILD_ENV_FILE: candidate.env", step)
+
     def test_build_script_captures_version_before_capability_checks(self) -> None:
         source = (ROOT / "scripts" / "build-release.sh").read_text(
             encoding="utf-8"

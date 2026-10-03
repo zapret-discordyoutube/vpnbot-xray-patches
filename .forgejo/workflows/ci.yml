@@ -20,17 +20,32 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Set up the Go version required by official Xray
-        uses: https://data.forgejo.org/actions/setup-go@v6
-        with:
-          go-version: "1.26"
-          cache: false
-
       - name: Install packaging tools
         run: |
           set -euo pipefail
           apt-get update
           apt-get install -y --no-install-recommends ca-certificates curl git openssl python3 unzip zip
+
+      # The same discovery as candidate.yml owns the official source: CI tests
+      # the patches against the release the train will build, not a manual pin.
+      - name: Resolve the newest official Xray release
+        id: discover
+        run: |
+          set -euo pipefail
+          python3 scripts/release_pipeline.py discover \
+            --forgejo-releases-url "${FORGEJO_API_URL}/repos/${FORGEJO_REPOSITORY}/releases" \
+            --output-env candidate.env \
+            --output-metadata candidate-metadata.json
+          set -a
+          source candidate.env
+          set +a
+          printf 'go_version=%s\n' "$GO_VERSION" >> "$FORGEJO_OUTPUT"
+
+      - name: Set up the Go version required by official Xray
+        uses: https://data.forgejo.org/actions/setup-go@v6
+        with:
+          go-version: ${{ steps.discover.outputs.go_version }}
+          cache: false
 
       - name: Validate the repository boundary
         run: |
@@ -50,9 +65,13 @@ jobs:
           fi
 
       - name: Apply and test the patches on official XTLS source
+        env:
+          VPNBOT_BUILD_ENV_FILE: candidate.env
         run: scripts/test-patches.sh
 
       - name: Build Linux release archives
+        env:
+          VPNBOT_BUILD_ENV_FILE: candidate.env
         run: scripts/build-release.sh release-assets
 
       - name: Upload the exact release candidates
