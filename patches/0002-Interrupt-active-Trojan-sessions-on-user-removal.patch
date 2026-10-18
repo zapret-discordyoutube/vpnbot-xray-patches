@@ -482,14 +482,14 @@ diff --git a/proxy/vless/inbound/inbound.go b/proxy/vless/inbound/inbound.go
 index 010e755f..8f0690f3 100644
 --- a/proxy/vless/inbound/inbound.go
 +++ b/proxy/vless/inbound/inbound.go
-@@ -9,7 +9,6 @@ import (
- 	"reflect"
+@@ -8,7 +8,6 @@ import (
+ 	"io"
  	"strconv"
  	"strings"
 -	"sync"
  	"time"
- 	"unsafe"
  
+ 	"github.com/xtls/xray-core/app/dispatcher"
 @@ -85,10 +84,7 @@ type Handler struct {
  	defaultDispatcher      routing.Dispatcher
  	ctx                    context.Context
