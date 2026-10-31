@@ -484,6 +484,7 @@ class ReleasePipelineTests(unittest.TestCase):
             service_name="vpnbot-xray.service",
             state_dir=Path("/state"),
             canary_script=Path("/canary.py"),
+            mptcp_check_script=Path("/mptcp.py"),
             timeout_seconds=900,
         )
         releases = [
@@ -514,6 +515,7 @@ class ReleasePipelineTests(unittest.TestCase):
             service_name="vpnbot-xray.service",
             state_dir=Path("/state"),
             canary_script=Path("/canary.py"),
+            mptcp_check_script=Path("/mptcp.py"),
             timeout_seconds=900,
         )
         output = (
@@ -1117,6 +1119,7 @@ class CanaryJumpTests(unittest.TestCase):
             service_name="vpnbot-xray.service",
             state_dir=Path("/state"),
             canary_script=Path("/canary.py"),
+            mptcp_check_script=Path("/mptcp.py"),
             timeout_seconds=900,
             **jump,
         )
@@ -1194,3 +1197,65 @@ class CanaryJumpTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MptcpGateTests(unittest.TestCase):
+    """CVE-2026-98432 (31.10.2026): a candidate whose Xray listens with MPTCP
+    never reaches the canary; the check fails closed when it cannot judge."""
+
+    def _settings(self) -> "pilot_and_promote.Settings":
+        return pilot_and_promote.Settings(
+            releases_url="https://forgejo.invalid/releases",
+            token_file=Path("/token"),
+            canary_node="canary",
+            canary_host="203.0.113.5",
+            canary_port=10222,
+            canary_user="root",
+            identity_file=Path("/key"),
+            known_hosts_file=Path("/known_hosts"),
+            updater_path="/usr/local/bin/vpnbot-xray-core-updater",
+            xray_path="/opt/vpnbot/xray-core/bin/xray",
+            config_dir="/opt/vpnbot/xray-core/config",
+            service_name="vpnbot-xray.service",
+            state_dir=Path("/state"),
+            canary_script=Path("/canary.py"),
+            mptcp_check_script=ROOT / "scripts" / "check_no_mptcp_listener.py",
+            timeout_seconds=900,
+        )
+
+    @staticmethod
+    def _archive() -> bytes:
+        import io
+        import zipfile
+
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as bundle:
+            bundle.writestr("xray", b"#!/bin/sh\nexit 0\n")
+        return buffer.getvalue()
+
+    def test_a_candidate_without_the_amd64_archive_is_refused(self) -> None:
+        with self.assertRaises(release_pipeline.PipelineError):
+            pilot_and_promote.assert_no_mptcp_listener(self._settings(), {})
+
+    def test_a_failed_check_refuses_the_candidate(self) -> None:
+        failed = subprocess.CompletedProcess([], 1, "", "check_no_mptcp_listener: FAILED — Xray listens with MPTCP")
+        with mock.patch.object(pilot_and_promote.subprocess, "run", return_value=failed) as run:
+            with self.assertRaises(release_pipeline.PipelineError) as caught:
+                pilot_and_promote.assert_no_mptcp_listener(self._settings(), {"Xray-linux-64.zip": self._archive()})
+        self.assertIn("MPTCP", str(caught.exception))
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[1:3], ["-I", str(ROOT / "scripts" / "check_no_mptcp_listener.py")])
+
+    def test_a_passed_check_lets_the_candidate_through(self) -> None:
+        passed = subprocess.CompletedProcess([], 0, "check_no_mptcp_listener: passed", "")
+        with mock.patch.object(pilot_and_promote.subprocess, "run", return_value=passed):
+            pilot_and_promote.assert_no_mptcp_listener(self._settings(), {"Xray-linux-64.zip": self._archive()})
+
+    def test_the_promoter_installs_the_check_script(self) -> None:
+        installer = (ROOT / "scripts" / "install_promoter.sh").read_text(encoding="utf-8")
+        self.assertIn("scripts/check_no_mptcp_listener.py", installer)
+
+    def test_the_check_script_compiles_and_names_its_own_namespace(self) -> None:
+        source = (ROOT / "scripts" / "check_no_mptcp_listener.py").read_text(encoding="utf-8")
+        compile(source, "check_no_mptcp_listener.py", "exec")
+        self.assertIn('"unshare", "--user", "--map-root-user", "--net"', source)

@@ -15,6 +15,7 @@ install -d -m 0755 /usr/local/libexec/vpnbot-xray-release-promoter
 install -m 0755 \
     "${REPOSITORY_ROOT}/scripts/release_pipeline.py" \
     "${REPOSITORY_ROOT}/scripts/canary_active_revoke.py" \
+    "${REPOSITORY_ROOT}/scripts/check_no_mptcp_listener.py" \
     "${REPOSITORY_ROOT}/scripts/pilot_and_promote.py" \
     "${REPOSITORY_ROOT}/scripts/release_alert_monitor.py" \
     /usr/local/libexec/vpnbot-xray-release-promoter/

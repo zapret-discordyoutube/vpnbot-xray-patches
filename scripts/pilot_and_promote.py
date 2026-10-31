@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import dataclasses
 import fcntl
+import io
 import json
 import os
 import re
@@ -12,7 +13,9 @@ import shlex
 import stat
 import subprocess
 import sys
+import tempfile
 import time
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +38,7 @@ class Settings:
     service_name: str
     state_dir: Path
     canary_script: Path
+    mptcp_check_script: Path
     timeout_seconds: int
     # An optional SSH jump to the canary.  27.09.2026 the host's direct route
     # to magnus timed out while the hub reached it through its
@@ -78,6 +82,9 @@ def load_settings() -> Settings:
         state_dir=Path(env("VPNBOT_XRAY_PROMOTER_STATE_DIR", "/var/lib/vpnbot-xray-release-promoter")),
         canary_script=Path(
             env("VPNBOT_XRAY_CANARY_SCRIPT", str(script_dir / "canary_active_revoke.py"))
+        ),
+        mptcp_check_script=Path(
+            env("VPNBOT_XRAY_MPTCP_CHECK_SCRIPT", str(script_dir / "check_no_mptcp_listener.py"))
         ),
         timeout_seconds=max(60, int(env("VPNBOT_XRAY_PROMOTER_TIMEOUT_SECONDS", "900"))),
         jump_host=env("VPNBOT_XRAY_CANARY_JUMP_HOST"),
@@ -139,6 +146,7 @@ def load_settings() -> Settings:
         "SSH identity": settings.identity_file,
         "known_hosts": settings.known_hosts_file,
         "canary script": settings.canary_script,
+        "MPTCP check script": settings.mptcp_check_script,
     }.items():
         if not path.is_file() or path.is_symlink():
             raise release_pipeline.PipelineError(f"{label} is missing or unsafe: {path}")
@@ -351,6 +359,38 @@ def resolve_previous_proven_tag(
     )
 
 
+#: The archive whose binary the MPTCP check starts (the compatible amd64 build).
+MPTCP_CHECK_ASSET = "Xray-linux-64.zip"
+
+
+def assert_no_mptcp_listener(settings: Settings, payloads: dict[str, bytes]) -> None:
+    """Refuse a candidate whose Xray listens with MPTCP, before any canary install.
+
+    The check (``check_no_mptcp_listener.py``) runs the binary in a network
+    namespace of its own, where MPTCP is on by kernel default whatever this
+    host set, and fails closed when it cannot judge.
+    """
+
+    archive = payloads.get(MPTCP_CHECK_ASSET)
+    if archive is None:
+        raise release_pipeline.PipelineError(f"candidate has no {MPTCP_CHECK_ASSET} for the MPTCP check")
+    with tempfile.TemporaryDirectory(prefix="vpnbot-xray-mptcp-") as directory:
+        binary = Path(directory) / "xray"
+        with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
+            binary.write_bytes(bundle.read("xray"))
+        binary.chmod(0o755)
+        result = subprocess.run(
+            [sys.executable, "-I", str(settings.mptcp_check_script), str(binary)],
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip().splitlines()[-1:] or ["no output"]
+        raise release_pipeline.PipelineError(f"candidate MPTCP check failed: {detail[0][:300]}")
+
+
 def run_canary(settings: Settings, expected_proven_tag: str) -> dict[str, Any]:
     script = settings.canary_script.read_bytes()
     result = remote_command(
@@ -457,7 +497,10 @@ def process_candidate(
         write_state(state_file, state)
         return
 
-    release_pipeline.validated_candidate_payloads(candidate, token=token)
+    _manifest, _manifest_bytes, payloads = release_pipeline.validated_candidate_payloads(candidate, token=token)
+    # Before the canary sees it: the candidate must not listen with MPTCP
+    # (CVE-2026-98432; Xray-core v26.10.31 turned MPTCP off by default).
+    assert_no_mptcp_listener(settings, payloads)
     current_statement, _ = remote_version(settings)
     previous_tag = str(
         state.get("previous_proven_tag")
@@ -501,6 +544,7 @@ def process_candidate(
     checks["candidate_manifest_valid"] = True
     checks["candidate_assets_valid"] = True
     checks["candidate_installed_by_atomic_updater"] = True
+    checks["candidate_opens_no_mptcp_listener"] = True
     proof = {
         "schema_version": 1,
         "result": "passed",
