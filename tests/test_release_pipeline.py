@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -941,6 +942,23 @@ class SourceUnavailabilityTests(unittest.TestCase):
             self.assertIn("Forgejo снова отвечает", sent[1])
             state = json.loads((settings.state_dir / "state.json").read_text())
             self.assertNotIn("unavailable_since_epoch", state["conditions"]["release_source"])
+
+    def test_state_is_readable_by_the_services_group_and_the_lock_is_not(self) -> None:
+        # VPnBot observability reads state.json as group vpnbot (04.11.2026);
+        # the unit gives the process that group, the modes give it read only.
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            settings = ReleasePipelineTests.alert_settings(Path(raw_tmp))
+            settings.state_dir.mkdir(mode=0o700)
+            release_alert_monitor.reconcile(settings, [], lambda _text: 1, 1_000)
+            self.assertEqual(stat.S_IMODE(settings.state_dir.stat().st_mode), 0o750)
+            state_file = settings.state_dir / "state.json"
+            self.assertEqual(stat.S_IMODE(state_file.stat().st_mode), 0o640)
+            lock = settings.state_dir / "monitor.lock"
+            with release_alert_monitor.monitor_lock(lock):
+                self.assertEqual(stat.S_IMODE(lock.stat().st_mode), 0o600)
+            state_file.chmod(0o660)
+            with self.assertRaises(release_pipeline.PipelineError):
+                release_alert_monitor.load_state(state_file)
 
     def test_outage_neither_resolves_nor_reopens_other_incidents(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:

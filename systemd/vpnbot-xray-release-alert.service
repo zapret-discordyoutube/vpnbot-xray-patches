@@ -7,11 +7,11 @@ ConditionPathExists=/etc/vpnbot-xray-release-alert.env
 [Service]
 Type=oneshot
 User=root
-Group=root
+Group=vpnbot
 EnvironmentFile=/etc/vpnbot-xray-release-alert.env
 Environment=PYTHONDONTWRITEBYTECODE=1
 ExecStart=/usr/local/libexec/vpnbot-xray-release-promoter/release_alert_monitor.py
-UMask=0077
+UMask=0027
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only

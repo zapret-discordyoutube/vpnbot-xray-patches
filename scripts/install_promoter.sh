@@ -26,7 +26,12 @@ install -m 0644 \
     "${REPOSITORY_ROOT}/systemd/vpnbot-xray-release-alert.timer" \
     /etc/systemd/system/
 install -d -m 0700 /var/lib/vpnbot-xray-release-promoter
-install -d -m 0700 /var/lib/vpnbot-xray-release-alert
+# The VPnBot observability service reads state.json as group vpnbot.
+install -d -m 0750 -o root -g vpnbot /var/lib/vpnbot-xray-release-alert
+if [[ -f /var/lib/vpnbot-xray-release-alert/state.json ]]; then
+    chgrp vpnbot /var/lib/vpnbot-xray-release-alert/state.json
+    chmod 0640 /var/lib/vpnbot-xray-release-alert/state.json
+fi
 systemctl daemon-reload
 
 if [[ -f /etc/vpnbot-xray-release-promoter.env ]]; then

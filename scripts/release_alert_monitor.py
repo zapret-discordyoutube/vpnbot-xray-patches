@@ -229,12 +229,20 @@ def load_settings() -> Settings:
     return settings
 
 
-def require_safe_regular_file(path: Path, label: str) -> None:
+def require_safe_regular_file(path: Path, label: str, *, group_reads: bool = False) -> None:
+    """A regular file only its owner can touch; ``group_reads`` lets the group read it.
+
+    Env files carry tokens and stay owner-only.  Only the alert state is read by
+    the group (:data:`STATE_FILE_MODE`); its group never writes it.
+    """
+
     if not path.is_file() or path.is_symlink():
         raise release_pipeline.PipelineError(f"{label} is missing or unsafe: {path}")
     mode = stat.S_IMODE(path.stat().st_mode)
-    if mode & 0o077:
-        raise release_pipeline.PipelineError(f"{label} must not be group/world-readable")
+    if mode & (0o037 if group_reads else 0o077):
+        raise release_pipeline.PipelineError(
+            f"{label} must not be {'group-writable or world-accessible' if group_reads else 'group/world-readable'}"
+        )
 
 
 def utc_now(epoch: int | None = None) -> str:
@@ -846,7 +854,7 @@ def new_state() -> dict[str, Any]:
 def load_state(path: Path) -> dict[str, Any]:
     if not path.exists():
         return new_state()
-    require_safe_regular_file(path, "release alert state")
+    require_safe_regular_file(path, "release alert state", group_reads=True)
     payload = release_pipeline.load_json(path)
     if (
         not isinstance(payload, dict)
@@ -862,9 +870,17 @@ def load_state(path: Path) -> dict[str, Any]:
     return payload
 
 
+#: The state is read by the VPnBot observability service, which runs as the
+#: services' account off root (group ``vpnbot``, 04.11.2026); the unit runs
+#: with that group, so the file and its directory belong to it.  The lock and
+#: the env file stay owner-only.
+STATE_FILE_MODE = 0o640
+STATE_DIR_MODE = 0o750
+
+
 def write_state(path: Path, payload: dict[str, Any]) -> None:
     release_pipeline.write_atomic(
-        path, release_pipeline.canonical_json_bytes(payload), mode=0o600
+        path, release_pipeline.canonical_json_bytes(payload), mode=STATE_FILE_MODE
     )
 
 
@@ -1042,10 +1058,10 @@ def reconcile(
     now_epoch: int,
     source_error: release_pipeline.SourceUnavailableError | None = None,
 ) -> dict[str, Any]:
-    settings.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    settings.state_dir.mkdir(parents=True, exist_ok=True, mode=STATE_DIR_MODE)
     if settings.state_dir.is_symlink():
         raise release_pipeline.PipelineError("release alert state directory is a symlink")
-    settings.state_dir.chmod(0o700)
+    settings.state_dir.chmod(STATE_DIR_MODE)
     path = settings.state_dir / "state.json"
     state = load_state(path)
     source_record = state["conditions"].setdefault("release_source", {"active": False})
