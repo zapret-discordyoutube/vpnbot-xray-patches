@@ -1277,3 +1277,115 @@ class MptcpGateTests(unittest.TestCase):
         source = (ROOT / "scripts" / "check_no_mptcp_listener.py").read_text(encoding="utf-8")
         compile(source, "check_no_mptcp_listener.py", "exec")
         self.assertIn('"unshare", "--user", "--map-root-user", "--net"', source)
+
+
+class ForgeHostTests(unittest.TestCase):
+    """The host's uplink filters the exact name git.zapret.moe by SNI (08-09.11.2026);
+    the numbered mirrors of the same store answer, so a process picks one name once."""
+
+    def setUp(self) -> None:
+        release_pipeline._forge_host = None
+        self.addCleanup(setattr, release_pipeline, "_forge_host", None)
+
+    @staticmethod
+    def answer(body: bytes = b"{}") -> mock.MagicMock:
+        response = mock.MagicMock()
+        response.__enter__.return_value.status = 200
+        response.__enter__.return_value.read.return_value = body
+        response.__exit__.return_value = False
+        return response
+
+    def fake_urlopen(self, dead: dict[str, Exception]):
+        """A urlopen that fails for the names in ``dead`` and answers for the rest."""
+
+        seen: list[tuple[str, str]] = []
+
+        def opener(request, timeout=None):
+            host = release_pipeline.urllib.parse.urlsplit(request.full_url).hostname
+            seen.append((request.get_method(), request.full_url))
+            if host in dead:
+                raise dead[host]
+            return self.answer()
+
+        opener.seen = seen
+        return opener
+
+    def test_the_first_answering_name_serves_the_request_and_rewrites_the_asset_host(self) -> None:
+        refused = release_pipeline.urllib.error.URLError("timed out")
+        opener = self.fake_urlopen({"git2.zapret.moe": refused, "git.zapret.moe": refused})
+        with mock.patch.object(release_pipeline.urllib.request, "urlopen", side_effect=opener):
+            raw = release_pipeline.request_bytes(
+                "https://git.zapret.moe/zapretkvn/vpnbot-xray-patches/releases/download/v1/x.zip"
+            )
+        self.assertEqual(raw, b"{}")
+        self.assertEqual(
+            [url for _, url in opener.seen],
+            [
+                "https://git2.zapret.moe/api/v1/version",
+                "https://git3.zapret.moe/api/v1/version",
+                "https://git3.zapret.moe/zapretkvn/vpnbot-xray-patches/releases/download/v1/x.zip",
+            ],
+        )
+
+    def test_the_name_is_chosen_once_and_a_write_stays_on_it(self) -> None:
+        opener = self.fake_urlopen({"git2.zapret.moe": release_pipeline.urllib.error.URLError("x")})
+        with mock.patch.object(release_pipeline.urllib.request, "urlopen", side_effect=opener):
+            release_pipeline.request_bytes("https://git.zapret.moe/api/v1/repos/a/b/releases")
+            release_pipeline.request_bytes(
+                "https://git.zapret.moe/api/v1/repos/a/b/releases", method="POST", payload=b"{}"
+            )
+        probes = [url for _, url in opener.seen if url.endswith("/api/v1/version")]
+        self.assertEqual(probes, ["https://git2.zapret.moe/api/v1/version", "https://git3.zapret.moe/api/v1/version"])
+        self.assertEqual(
+            opener.seen[-1], ("POST", "https://git3.zapret.moe/api/v1/repos/a/b/releases")
+        )
+
+    def test_a_name_that_answers_with_an_error_status_does_not_end_the_walk(self) -> None:
+        bad_gateway = release_pipeline.urllib.error.HTTPError(
+            "https://git2.zapret.moe/api/v1/version", 502, "bad gateway", {}, None
+        )
+        opener = self.fake_urlopen({"git2.zapret.moe": bad_gateway})
+        with mock.patch.object(release_pipeline.urllib.request, "urlopen", side_effect=opener):
+            self.assertEqual(release_pipeline.forge_host(), "git3.zapret.moe")
+
+    def test_no_name_answering_is_the_typed_unreachable_source_with_every_reason(self) -> None:
+        refused = release_pipeline.urllib.error.URLError("[SSL: UNEXPECTED_EOF_WHILE_READING]")
+        opener = self.fake_urlopen({name: refused for name in release_pipeline.FORGE_HOSTS})
+        with (
+            mock.patch.object(release_pipeline.urllib.request, "urlopen", side_effect=opener),
+            self.assertRaises(release_pipeline.SourceUnavailableError) as raised,
+        ):
+            release_pipeline.request_bytes("https://git.zapret.moe/api/v1/repos/a/b/releases")
+        self.assertEqual(raised.exception.code, release_pipeline.SOURCE_UNREACHABLE)
+        for name in release_pipeline.FORGE_HOSTS:
+            self.assertIn(name, str(raised.exception))
+        self.assertEqual(len(opener.seen), len(release_pipeline.FORGE_HOSTS))
+        self.assertIsNone(release_pipeline._forge_host)
+
+    def test_other_hosts_are_neither_probed_nor_rewritten(self) -> None:
+        opener = self.fake_urlopen({})
+        for url in (
+            "https://github.com/XTLS/Xray-core/releases.atom",
+            "https://forgejo.invalid/api/v1/x",
+            "http://git.zapret.moe/api/v1/x",
+            "https://git.zapret.moe.evil.example/api/v1/x",
+            "https://git.zapret.moe:8443/api/v1/x",
+        ):
+            self.assertEqual(release_pipeline.via_forge(url), url)
+        with mock.patch.object(release_pipeline.urllib.request, "urlopen", side_effect=opener):
+            release_pipeline.request_bytes("https://github.com/XTLS/Xray-core/releases.atom")
+        self.assertEqual([url for _, url in opener.seen], ["https://github.com/XTLS/Xray-core/releases.atom"])
+        self.assertIsNone(release_pipeline._forge_host)
+
+    def test_the_probe_carries_no_token(self) -> None:
+        opener = self.fake_urlopen({})
+        requests = []
+        with mock.patch.object(
+            release_pipeline.urllib.request,
+            "urlopen",
+            side_effect=lambda request, timeout=None: requests.append(request) or opener(request, timeout),
+        ):
+            release_pipeline.request_bytes("https://git.zapret.moe/api/v1/x", token="secret-token")
+        probe, real = requests
+        self.assertIsNone(probe.get_header("Authorization"))
+        self.assertEqual(real.get_header("Authorization"), "token secret-token")

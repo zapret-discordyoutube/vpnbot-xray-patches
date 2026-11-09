@@ -35,6 +35,16 @@ HTTP_USER_AGENT = (
     "vpnbot-xray-release-pipeline/1 "
     "(+https://git.zapret.moe/zapretkvn/vpnbot-xray-patches)"
 )
+#: The names of the one Forgejo store, the open ones first (zapret-links never
+#: removes a name; the node side keeps the same seed in
+#: ``vpnbot_node_services/shared/site_names.py``).  The production host's own
+#: uplink filters the exact name ``git.zapret.moe`` by SNI (68 promoter runs
+#: deferred between 08.11.2026 00:05 and 09.11.2026 13:00); the numbered
+#: mirrors answer on the same address with the same content.
+FORGE_HOSTS = (*(f"git{number}.zapret.moe" for number in range(2, 7)), "git.zapret.moe")
+FORGE_PROBE_PATH = "/api/v1/version"
+FORGE_PROBE_TIMEOUT = 10
+FORGE_NAME_RE = re.compile(r"^git[0-9]*\.zapret\.moe$")
 ATOM_NAMESPACE = "http://www.w3.org/2005/Atom"
 MANIFEST_NAME = "vpnbot-xray-release-manifest.json"
 PROOF_NAME = "vpnbot-xray-pilot-proof.json"
@@ -147,6 +157,59 @@ def write_atomic(path: Path, payload: bytes, mode: int = 0o644) -> None:
         temporary.unlink(missing_ok=True)
 
 
+_forge_host: str | None = None
+
+
+def forge_host() -> str:
+    """The name of the Forgejo store this process reaches, chosen once.
+
+    Every name is asked for the unauthenticated version document, the open
+    ones first; the first that answers 200 is used for every later request of
+    the process, reads and writes alike, so that a write is never repeated on
+    another name after an ambiguous failure.  No answer at all is the typed
+    unreachable source, with what each name said.
+    """
+
+    global _forge_host
+    if _forge_host is not None:
+        return _forge_host
+    failures: list[str] = []
+    for name in FORGE_HOSTS:
+        probe = urllib.request.Request(
+            f"https://{name}{FORGE_PROBE_PATH}",
+            headers={"Accept": "application/json", "User-Agent": HTTP_USER_AGENT},
+        )
+        try:
+            with urllib.request.urlopen(probe, timeout=FORGE_PROBE_TIMEOUT) as response:
+                if response.status == 200:
+                    _forge_host = name
+                    return name
+                failures.append(f"{name}: HTTP {response.status}")
+        except urllib.error.HTTPError as exc:
+            failures.append(f"{name}: HTTP {exc.code}")
+        except (urllib.error.URLError, http.client.RemoteDisconnected, TimeoutError) as exc:
+            reason = exc.reason if isinstance(exc, urllib.error.URLError) else str(exc)
+            failures.append(f"{name}: {reason}")
+    raise SourceUnavailableError(
+        SOURCE_UNREACHABLE, "no Forgejo name answers: " + "; ".join(failures)
+    )
+
+
+def via_forge(url: str) -> str:
+    """``url`` on the name of the store this process reaches.
+
+    Only a plain https URL of one of the store's own names is rewritten:
+    Forgejo writes ``git.zapret.moe`` into the download addresses of release
+    assets, and that exact name is the one a host's uplink may filter.  Any
+    other host (the official feed, a test double) is left as it is.
+    """
+
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme != "https" or not FORGE_NAME_RE.fullmatch(parts.netloc.lower()):
+        return url
+    return urllib.parse.urlunsplit(parts._replace(netloc=forge_host()))
+
+
 def request_bytes(
     url: str,
     *,
@@ -157,6 +220,7 @@ def request_bytes(
     accept: str = "application/json",
     timeout: int = 90,
 ) -> bytes:
+    url = via_forge(url)
     headers = {
         "Accept": accept,
         "User-Agent": HTTP_USER_AGENT,
