@@ -40,41 +40,116 @@ class Settings:
     canary_script: Path
     mptcp_check_script: Path
     timeout_seconds: int
-    # An optional SSH jump to the canary.  27.09.2026 the host's direct route
-    # to magnus timed out while the hub reached it through its
-    # control-plane bridges, and every candidate stopped at "reading canary
-    # Xray version".  All four fields are set together, or none.
-    jump_host: str = ""
-    jump_port: int = 0
-    jump_user: str = ""
-    jump_identity_file: Path | None = None
 
 
 def env(name: str, default: str = "") -> str:
     return str(os.environ.get(name, default)).strip()
 
 
-def _int_setting(name: str) -> int:
-    raw = env(name, "0") or "0"
-    if not raw.isdigit():
-        raise release_pipeline.PipelineError(f"{name} must be a number")
-    return int(raw)
+#: The hub's registry CLI and store: the canary is the node the hub marks
+#: (``vpnbot_node_manager/xray_canary.py``, owner decision 15.11.2026).  Until
+#: then the node was written into this unit's env by hand, and the deleted
+#: tinl3 failed every run from 14.11 on its missing pin.
+HUB_PYTHON = "/opt/vpnbot-node-manager/venv/bin/python"
+HUB_MANAGE = "/opt/vpnbot-node-manager/scripts/manage_node.py"
+HUB_INVENTORY = "/etc/vpnbot-node-manager/inventory.sqlite3"
+
+
+def hub_canary() -> dict[str, Any]:
+    """The canary's direct endpoint as the hub names it now; it moves the mark itself."""
+
+    command = [
+        env("VPNBOT_XRAY_HUB_PYTHON", HUB_PYTHON),
+        env("VPNBOT_XRAY_HUB_MANAGE", HUB_MANAGE),
+        "--db",
+        env("VPNBOT_XRAY_HUB_INVENTORY", HUB_INVENTORY),
+        "xray-canary",
+        "--apply",
+    ]
+    completed = subprocess.run(command, capture_output=True, text=True, timeout=120, check=False)
+    if completed.returncode != 0:
+        raise release_pipeline.PipelineError(
+            f"the hub named no Xray canary (exit {completed.returncode}): {completed.stderr.strip()[-300:]}"
+        )
+    lines = completed.stdout.strip().splitlines()
+    try:
+        canary = json.loads(lines[-1])["canary"] if lines else None
+    except (ValueError, KeyError, TypeError):
+        canary = None
+    if not isinstance(canary, dict):
+        raise release_pipeline.PipelineError("the hub's canary answer is not readable")
+    return canary
+
+
+#: The node's own CPU verdict (node-baseline ``shared/cpu_profile.py``): the
+#: candidate pilot must prove the GOAMD64 v3 build, so a baseline CPU cannot be
+#: the canary.
+NODE_CPU_PROFILE = "/usr/local/lib/vpnbot-node/vpnbot_cpu_profile.py"
+#: The hub's label that keeps a node out of the canary choice.
+NO_XRAY_CANARY_LABEL = "no-xray-canary"
+#: How many nodes one run may hand back to the hub before it gives up.
+MAX_CANARY_HANDOVERS = 8
+
+
+def hub_exclude(node_id: str) -> None:
+    """Tell the hub this node cannot be the canary; it moves the mark on the next question."""
+
+    completed = subprocess.run(
+        [
+            env("VPNBOT_XRAY_HUB_PYTHON", HUB_PYTHON),
+            env("VPNBOT_XRAY_HUB_MANAGE", HUB_MANAGE),
+            "--db",
+            env("VPNBOT_XRAY_HUB_INVENTORY", HUB_INVENTORY),
+            "label",
+            "add",
+            "--node-id",
+            node_id,
+            "--label",
+            NO_XRAY_CANARY_LABEL,
+            "--apply",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise release_pipeline.PipelineError(
+            f"the hub refused to exclude {node_id} from the canary: {completed.stderr.strip()[-300:]}"
+        )
+
+
+def canary_with_v3(settings: Settings) -> Settings:
+    """The hub's canary, handed back to the hub while its CPU cannot run the v3 build."""
+
+    for _ in range(MAX_CANARY_HANDOVERS):
+        profile = require_remote_success(
+            remote_command(settings, ["python3", NODE_CPU_PROFILE, "--field", "cpu_profile"], timeout=30),
+            "reading canary CPU profile",
+        )
+        if profile == "v3":
+            return settings
+        print(f"Canary {settings.canary_node} has CPU profile {profile or '<none>'}: handed back to the hub")
+        hub_exclude(settings.canary_node)
+        settings = load_settings()
+    raise release_pipeline.PipelineError("the hub named no canary with a GOAMD64 v3 CPU")
 
 
 def load_settings() -> Settings:
     script_dir = Path(__file__).resolve().parent
+    canary = hub_canary()
     settings = Settings(
         releases_url=env(
             "VPNBOT_XRAY_FORGEJO_RELEASES_URL",
             "https://git.zapret.moe/api/v1/repos/zapretkvn/vpnbot-xray-patches/releases",
         ),
         token_file=Path(env("VPNBOT_XRAY_FORGEJO_TOKEN_FILE")),
-        canary_node=env("VPNBOT_XRAY_CANARY_NODE"),
-        canary_host=env("VPNBOT_XRAY_CANARY_HOST"),
-        canary_port=int(env("VPNBOT_XRAY_CANARY_SSH_PORT", "10222")),
-        canary_user=env("VPNBOT_XRAY_CANARY_SSH_USER", "root"),
-        identity_file=Path(env("VPNBOT_XRAY_CANARY_IDENTITY_FILE", "/root/.ssh/id_ed25519")),
-        known_hosts_file=Path(env("VPNBOT_XRAY_CANARY_KNOWN_HOSTS_FILE", "/root/.ssh/known_hosts")),
+        canary_node=str(canary.get("node_id") or ""),
+        canary_host=str(canary.get("host") or ""),
+        canary_port=int(canary.get("port") or 0),
+        canary_user=str(canary.get("user") or ""),
+        identity_file=Path(str(canary.get("identity_file") or "")),
+        known_hosts_file=Path(str(canary.get("known_hosts_file") or "")),
         updater_path=env("VPNBOT_XRAY_CANARY_UPDATER", "/usr/local/bin/vpnbot-xray-core-updater"),
         xray_path=env("VPNBOT_XRAY_CANARY_BINARY", "/opt/vpnbot/xray-core/bin/xray"),
         config_dir=env("VPNBOT_XRAY_CANARY_CONFIG_DIR", "/opt/vpnbot/xray-core/config"),
@@ -87,14 +162,6 @@ def load_settings() -> Settings:
             env("VPNBOT_XRAY_MPTCP_CHECK_SCRIPT", str(script_dir / "check_no_mptcp_listener.py"))
         ),
         timeout_seconds=max(60, int(env("VPNBOT_XRAY_PROMOTER_TIMEOUT_SECONDS", "900"))),
-        jump_host=env("VPNBOT_XRAY_CANARY_JUMP_HOST"),
-        jump_port=_int_setting("VPNBOT_XRAY_CANARY_JUMP_PORT"),
-        jump_user=env("VPNBOT_XRAY_CANARY_JUMP_USER"),
-        jump_identity_file=(
-            Path(env("VPNBOT_XRAY_CANARY_JUMP_IDENTITY_FILE"))
-            if env("VPNBOT_XRAY_CANARY_JUMP_IDENTITY_FILE")
-            else None
-        ),
     )
     if not settings.releases_url.startswith("https://"):
         raise release_pipeline.PipelineError("Forgejo releases URL must use HTTPS")
@@ -107,40 +174,6 @@ def load_settings() -> Settings:
             raise release_pipeline.PipelineError(f"invalid {label}")
     if not 1 <= settings.canary_port <= 65535:
         raise release_pipeline.PipelineError("invalid canary SSH port")
-    jump_fields = (
-        settings.jump_host,
-        settings.jump_port,
-        settings.jump_user,
-        settings.jump_identity_file,
-    )
-    if any(jump_fields):
-        if not all(jump_fields):
-            raise release_pipeline.PipelineError(
-                "a canary SSH jump needs host, port, user and identity together"
-            )
-        for label, value in {
-            "jump host": settings.jump_host,
-            "jump user": settings.jump_user,
-        }.items():
-            if not re.fullmatch(r"[A-Za-z0-9_.:-]+", value):
-                raise release_pipeline.PipelineError(f"invalid canary {label}")
-        if not 1 <= settings.jump_port <= 65535:
-            raise release_pipeline.PipelineError("invalid canary jump SSH port")
-        # ssh runs ProxyCommand through the shell and expands %-tokens in it:
-        # every value placed there is a plain path or name, never quoted text.
-        if not re.fullmatch(r"[A-Za-z0-9_./@+-]+", str(settings.known_hosts_file)):
-            raise release_pipeline.PipelineError(
-                f"canary known_hosts path is unsafe for a jump: {settings.known_hosts_file}"
-            )
-        assert settings.jump_identity_file is not None
-        if (
-            not settings.jump_identity_file.is_file()
-            or settings.jump_identity_file.is_symlink()
-            or not re.fullmatch(r"[A-Za-z0-9_./@+-]+", str(settings.jump_identity_file))
-        ):
-            raise release_pipeline.PipelineError(
-                f"canary jump SSH identity is missing or unsafe: {settings.jump_identity_file}"
-            )
     for label, path in {
         "token file": settings.token_file,
         "SSH identity": settings.identity_file,
@@ -192,24 +225,8 @@ def ssh_base(settings: Settings) -> list[str]:
         f"UserKnownHostsFile={settings.known_hosts_file}",
         "-o",
         "ConnectTimeout=15",
-        *jump_options(settings),
         f"{settings.canary_user}@{settings.canary_host}",
     ]
-
-
-def jump_options(settings: Settings) -> list[str]:
-    """The hub's own jump shape: the canary key and host pin stay end to end."""
-
-    if not settings.jump_host:
-        return []
-    proxy = (
-        f"ssh -W %h:%p -p {settings.jump_port} -i {settings.jump_identity_file} "
-        "-o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes "
-        f"-o UserKnownHostsFile={settings.known_hosts_file} "
-        "-o ConnectTimeout=15 "
-        f"{settings.jump_user}@{settings.jump_host}"
-    )
-    return ["-o", f"ProxyCommand={proxy}"]
 
 
 def remote_command(
@@ -591,6 +608,7 @@ def main() -> int:
                 print("No unproven VPnBot Xray candidate is waiting")
                 return 0
             candidate, manifest, manifest_bytes = selected
+            settings = canary_with_v3(settings)
             process_candidate(settings, token, candidate, manifest, manifest_bytes)
             return 0
     except BlockingIOError:
