@@ -15,7 +15,10 @@ UMask=0077
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/var/lib/vpnbot-xray-release-promoter
+# The canary is asked from the hub's registry on every run (manage_node.py
+# xray-canary --apply): it may move the mark in inventory.sqlite3 and reads
+# the transport circuits in manager.sqlite3, as the hub's own timers do.
+ReadWritePaths=/var/lib/vpnbot-xray-release-promoter /etc/vpnbot-node-manager /var/lib/vpnbot-node-manager
 NoNewPrivileges=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes

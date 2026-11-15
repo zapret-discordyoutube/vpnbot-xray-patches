@@ -1123,6 +1123,20 @@ class HubCanaryTests(unittest.TestCase):
     The deleted tinl3 stayed in /etc/vpnbot-xray-release-promoter.env and every
     run from 14.11 failed on its missing pin."""
 
+    def test_the_unit_lets_the_promoter_ask_the_hub(self) -> None:
+        # 15.11.2026 the first live run failed: ProtectSystem=strict made the
+        # hub registry read-only, and opening it writes (schema step), so the
+        # hub could name no canary from inside the unit.
+        unit = (ROOT / "systemd" / "vpnbot-xray-release-promoter.service").read_text(encoding="utf-8")
+        granted = {
+            path
+            for line in unit.splitlines()
+            if line.startswith("ReadWritePaths=")
+            for path in line.split("=", 1)[1].split()
+        }
+        self.assertIn(str(Path(pilot_and_promote.HUB_INVENTORY).parent), granted)
+        self.assertIn("/var/lib/vpnbot-node-manager", granted)  # manager.sqlite3: the circuits
+
     def _files(self, root: Path) -> dict[str, str]:
         for name in ("token", "key", "known_hosts", "canary.py", "mptcp.py"):
             (root / name).write_text("x\n", encoding="utf-8")
