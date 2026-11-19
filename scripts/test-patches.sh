@@ -20,3 +20,6 @@ go test -timeout 30m \
 
 go test -timeout 30m ./testing/scenarios \
     -run 'TestCommanderRemove(Trojan|VMess|Shadowsocks)UserInterrupts'
+
+# 0004: inbounds that receive client sockets from the node's 443 dispatcher, with the race detector.
+go test -race -timeout 10m ./transport/internet ./transport/internet/tcp

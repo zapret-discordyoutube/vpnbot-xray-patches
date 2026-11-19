@@ -76,12 +76,15 @@ while read -r expected_digest patch_name extra; do
     git -C "$DESTINATION" am --quiet --committer-date-is-author-date "$patch_path"
 done < "${REPOSITORY_ROOT}/patches/series"
 
-[[ "$(git -C "$DESTINATION" rev-list --count "${XRAY_UPSTREAM_COMMIT}..HEAD")" == 3 ]] \
-    || fail "the prepared source does not contain exactly three VPnBot patches"
+expected_patches="$(grep -c '[^[:space:]]' "${REPOSITORY_ROOT}/patches/series")"
+[[ "$(git -C "$DESTINATION" rev-list --count "${XRAY_UPSTREAM_COMMIT}..HEAD")" == "$expected_patches" ]] \
+    || fail "the prepared source does not contain exactly the ${expected_patches} patches of patches/series"
 grep -Fq 'vpnbot-active-revoke-v3' "${DESTINATION}/VPNBOT_ACTIVE_REVOKE.md" \
     || fail "the active-revocation capability marker is missing"
 grep -Fq 'VPnBot capability: vpnbot-active-revoke-v3' "${DESTINATION}/core/core.go" \
     || fail "the runtime capability marker is missing"
+grep -Fq 'VPnBot capability: vpnbot-socket-handoff-v1' "${DESTINATION}/core/core.go" \
+    || fail "the socket-handoff capability marker is missing"
 grep -Fq 'vpnbot-live-user-audit-v1' "${DESTINATION}/VPNBOT_ACTIVE_REVOKE.md" \
     || fail "the live-user-audit capability documentation is missing"
 grep -Fq 'VPnBot capability: vpnbot-live-user-audit-v1' "${DESTINATION}/core/core.go" \
@@ -90,5 +93,5 @@ grep -Fq 'cmdVPnBotLiveUserAudit' "${DESTINATION}/main/commands/all/api/api.go" 
     || fail "the live-user-audit command is not registered"
 git -C "$DESTINATION" diff --check "$XRAY_UPSTREAM_COMMIT..HEAD"
 
-printf 'Prepared official XTLS/Xray-core %s with VPnBot capabilities %s and %s\n' \
-    "$XRAY_UPSTREAM_TAG" "vpnbot-active-revoke-v3" "vpnbot-live-user-audit-v1"
+printf 'Prepared official XTLS/Xray-core %s with VPnBot capabilities %s, %s and %s\n' \
+    "$XRAY_UPSTREAM_TAG" "vpnbot-active-revoke-v3" "vpnbot-live-user-audit-v1" "vpnbot-socket-handoff-v1"

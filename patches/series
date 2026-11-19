@@ -1,3 +1,4 @@
 91dfa7ef5110b0cef8ba85e9ab87d83477e4f58389fea47be8bf1095386ed135  0001-Interrupt-active-VLESS-sessions-on-user-removal.patch
 5b16b1d8d0bc0b86814147553c48066e49264507dd6eea329c9c1a2a180990b3  0002-Interrupt-active-Trojan-sessions-on-user-removal.patch
 2ed86e5e8370efc6a8cd77c33bb814fc01716fd0aad773206eac7cdd08520e35  0003-Interrupt-all-managed-Xray-user-sessions.patch
+db36c358b0d85a8dbb61ea7f1b846f0e4c5dd984584ac8350fef544c14ac2fc7  0004-Accept-client-sockets-handed-over-by-the-443-dispatcher.patch

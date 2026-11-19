@@ -294,8 +294,8 @@ def read_patch_rows(repository_root: Path) -> list[dict[str, str]]:
         if actual != fields[0]:
             raise PipelineError(f"patch digest mismatch: {name}")
         rows.append({"name": name, "sha256": actual})
-    if len(rows) != 3:
-        raise PipelineError(f"expected exactly three patches, got {len(rows)}")
+    if not rows:  # the series is the one list of our patches; how many it has is its own business
+        raise PipelineError("patches/series lists no patch")
     return rows
 
 
@@ -694,8 +694,8 @@ def validate_manifest(manifest: Any) -> None:
     if not HEX64_RE.fullmatch(str(patches.get("set_sha256") or "")):
         raise PipelineError("release manifest patch set hash is invalid")
     items = patches.get("items")
-    if not isinstance(items, list) or len(items) != 3:
-        raise PipelineError("release manifest must contain exactly three patches")
+    if not isinstance(items, list) or not items:
+        raise PipelineError("release manifest lists no patch")
     for item in items:
         if (
             not isinstance(item, dict)

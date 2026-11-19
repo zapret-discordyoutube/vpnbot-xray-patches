@@ -1,0 +1,500 @@
+From 46afea3ec7eb400498d3f7b78a735c4db7251941 Mon Sep 17 00:00:00 2001
+From: loop-uh <loop-uh@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 15:40:45 -0500
+Subject: [PATCH] Accept client sockets handed over by the node's 443
+ dispatcher
+
+A unix listen path ending in .handoff is a SOCK_SEQPACKET listener whose
+clients are TCP sockets passed with SCM_RIGHTS by the node's 443
+dispatcher (vpnbot node-services go/cmd/sni-dispatch). The dispatcher
+peeks the ClientHello without consuming it, picks the inbound by SNI and
+hands over the client socket itself, so the inbound reads the untouched
+ClientHello, sees the real client address and no proxy stays in the data
+path. Accept returns *net.TCPConn; anything else received is closed; a
+full backlog holds the sender (backpressure); Close ends Accept with
+net.ErrClosed and frees the path. acceptProxyProtocol is refused on such a
+path: there is no proxy, so there is no header.
+
+Capability marker: vpnbot-socket-handoff-v1.
+---
+ core/core.go                                  |   1 +
+ transport/internet/handoff_listener_linux.go  | 194 +++++++++++++++++
+ .../internet/handoff_listener_linux_test.go   | 201 ++++++++++++++++++
+ transport/internet/handoff_listener_other.go  |  20 ++
+ transport/internet/system_listener.go         |  13 ++
+ 5 files changed, 429 insertions(+)
+ create mode 100644 transport/internet/handoff_listener_linux.go
+ create mode 100644 transport/internet/handoff_listener_linux_test.go
+ create mode 100644 transport/internet/handoff_listener_other.go
+
+diff --git a/core/core.go b/core/core.go
+index d96644c..572358f 100644
+--- a/core/core.go
++++ b/core/core.go
+@@ -72,5 +72,6 @@ func VersionStatement() []string {
+ 		"VPnBot capability: vpnbot-active-revoke-v2",
+ 		"VPnBot capability: vpnbot-active-revoke-v3",
+ 		"VPnBot capability: vpnbot-live-user-audit-v1",
++		"VPnBot capability: vpnbot-socket-handoff-v1",
+ 	}
+ }
+diff --git a/transport/internet/handoff_listener_linux.go b/transport/internet/handoff_listener_linux.go
+new file mode 100644
+index 0000000..353e3aa
+--- /dev/null
++++ b/transport/internet/handoff_listener_linux.go
+@@ -0,0 +1,194 @@
++//go:build linux
++
++package internet
++
++import (
++	"context"
++	"net"
++	"os"
++	"strings"
++	"sync"
++	"syscall"
++
++	"github.com/xtls/xray-core/common/errors"
++)
++
++// HandoffSuffix marks a unix listen path whose clients are TCP sockets handed over by the node's 443
++// dispatcher, not unix connections: the dispatcher peeks the ClientHello (nothing is consumed), picks the
++// inbound by its SNI and passes the client socket itself over a SOCK_SEQPACKET socket (SCM_RIGHTS).
++// The inbound then owns an ordinary TCP connection: the untouched ClientHello is the first thing it
++// reads, RemoteAddr is the real client, and no proxy sits in the data path. A handoff inbound must not
++// set acceptProxyProtocol: there is no proxy, so there is no header.
++const HandoffSuffix = ".handoff"
++
++func isHandoffPath(address string) bool { return strings.HasSuffix(address, HandoffSuffix) }
++
++// handoffBacklog bounds the sockets received but not yet accepted. When it is full the reader stops
++// reading, the dispatcher's sends block, and the dispatcher queues: backpressure end to end.
++const handoffBacklog = 64
++
++// handoffMaxRights is how many descriptors one message may carry; the dispatcher sends one.
++const handoffMaxRights = 16
++
++type handoffListener struct {
++	unix   *net.UnixListener
++	locker *FileLocker
++	conns  chan net.Conn
++	done   chan struct{}
++	once   sync.Once
++	mu     sync.Mutex
++	peers  map[*net.UnixConn]struct{}
++}
++
++func listenHandoff(address string, perm *os.FileMode, locker *FileLocker) (net.Listener, error) {
++	// The lock is held, so a socket file left at the path belongs to no running listener.
++	if err := os.Remove(address); err != nil && !os.IsNotExist(err) {
++		return nil, errors.New("failed to remove the stale handoff socket ", address).Base(err)
++	}
++	unix, err := net.ListenUnix("unixpacket", &net.UnixAddr{Name: address, Net: "unixpacket"})
++	if err != nil {
++		return nil, err
++	}
++	if perm != nil {
++		if err := os.Chmod(address, *perm); err != nil {
++			unix.Close()
++			return nil, errors.New("failed to set permission for ", address).Base(err)
++		}
++	}
++	l := &handoffListener{
++		unix:   unix,
++		locker: locker,
++		conns:  make(chan net.Conn, handoffBacklog),
++		done:   make(chan struct{}),
++		peers:  map[*net.UnixConn]struct{}{},
++	}
++	go l.acceptDispatchers()
++	return l, nil
++}
++
++func (l *handoffListener) acceptDispatchers() {
++	for {
++		peer, err := l.unix.AcceptUnix()
++		if err != nil {
++			return // closed
++		}
++		l.mu.Lock()
++		select {
++		case <-l.done:
++			l.mu.Unlock()
++			peer.Close()
++			return
++		default:
++		}
++		l.peers[peer] = struct{}{}
++		l.mu.Unlock()
++		go l.receive(peer)
++	}
++}
++
++// receive reads handed-over sockets from one dispatcher connection until it closes.
++func (l *handoffListener) receive(peer *net.UnixConn) {
++	defer func() {
++		l.mu.Lock()
++		delete(l.peers, peer)
++		l.mu.Unlock()
++		peer.Close()
++	}()
++	payload := make([]byte, 1)
++	oob := make([]byte, syscall.CmsgSpace(handoffMaxRights*4))
++	for {
++		_, oobn, flags, _, err := peer.ReadMsgUnix(payload, oob)
++		if err != nil {
++			return
++		}
++		fds := handoffRights(oob[:oobn])
++		if flags&syscall.MSG_CTRUNC != 0 {
++			// Descriptors beyond the buffer were closed by the kernel; the ones received are still ours.
++			errors.LogWarning(context.Background(), "handoff: control message truncated")
++		}
++		for _, fd := range fds {
++			conn, ok := handoffConn(fd)
++			if !ok {
++				continue
++			}
++			select {
++			case l.conns <- conn:
++			case <-l.done:
++				conn.Close()
++				for _, rest := range fds {
++					if rest > fd {
++						syscall.Close(rest)
++					}
++				}
++				return
++			}
++		}
++	}
++}
++
++func handoffRights(oob []byte) []int {
++	msgs, err := syscall.ParseSocketControlMessage(oob)
++	if err != nil {
++		return nil
++	}
++	var fds []int
++	for i := range msgs {
++		if rights, err := syscall.ParseUnixRights(&msgs[i]); err == nil {
++			fds = append(fds, rights...)
++		}
++	}
++	return fds
++}
++
++// handoffConn turns a received descriptor into a connection; anything but a TCP stream socket is closed.
++func handoffConn(fd int) (net.Conn, bool) {
++	syscall.CloseOnExec(fd)
++	file := os.NewFile(uintptr(fd), "handoff")
++	conn, err := net.FileConn(file) // dup: the connection owns its own descriptor
++	file.Close()
++	if err != nil {
++		return nil, false
++	}
++	if _, isTCP := conn.(*net.TCPConn); !isTCP {
++		conn.Close()
++		return nil, false
++	}
++	return conn, true
++}
++
++func (l *handoffListener) Accept() (net.Conn, error) {
++	select {
++	case conn := <-l.conns:
++		return conn, nil
++	case <-l.done:
++		return nil, net.ErrClosed // "use of closed network connection": the hub's accept loop stops on it
++	}
++}
++
++func (l *handoffListener) Close() error {
++	var err error
++	l.once.Do(func() {
++		close(l.done)
++		err = l.unix.Close()
++		l.mu.Lock()
++		for peer := range l.peers {
++			peer.Close()
++		}
++		l.mu.Unlock()
++	drain:
++		for {
++			select {
++			case conn := <-l.conns:
++				conn.Close()
++			default:
++				break drain
++			}
++		}
++		if l.locker != nil {
++			l.locker.Release()
++		}
++	})
++	return err
++}
++
++func (l *handoffListener) Addr() net.Addr { return l.unix.Addr() }
+diff --git a/transport/internet/handoff_listener_linux_test.go b/transport/internet/handoff_listener_linux_test.go
+new file mode 100644
+index 0000000..0b0019e
+--- /dev/null
++++ b/transport/internet/handoff_listener_linux_test.go
+@@ -0,0 +1,201 @@
++//go:build linux
++
++package internet_test
++
++import (
++	"context"
++	"errors"
++	"io"
++	"net"
++	"os"
++	"path/filepath"
++	"syscall"
++	"testing"
++	"time"
++
++	"github.com/xtls/xray-core/transport/internet"
++)
++
++// handOver plays the dispatcher: it accepts one TCP client and passes the socket over the handoff path.
++func handOver(t *testing.T, path string, server *net.TCPConn) {
++	t.Helper()
++	d, err := net.DialUnix("unixpacket", nil, &net.UnixAddr{Name: path, Net: "unixpacket"})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer d.Close()
++	f, err := server.File()
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer f.Close()
++	if _, _, err := d.WriteMsgUnix([]byte{0}, syscall.UnixRights(int(f.Fd())), nil); err != nil {
++		t.Fatal(err)
++	}
++	server.Close() // the dispatcher keeps nothing
++}
++
++func tcpPair(t *testing.T) (client net.Conn, server *net.TCPConn) {
++	t.Helper()
++	l, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer l.Close()
++	client, err = net.Dial("tcp", l.Addr().String())
++	if err != nil {
++		t.Fatal(err)
++	}
++	s, err := l.Accept()
++	if err != nil {
++		t.Fatal(err)
++	}
++	return client, s.(*net.TCPConn)
++}
++
++func listen(t *testing.T, sockopt *internet.SocketConfig) (net.Listener, string) {
++	t.Helper()
++	path := filepath.Join(t.TempDir(), "inbound"+internet.HandoffSuffix)
++	l, err := internet.ListenSystem(context.Background(), &net.UnixAddr{Name: path, Net: "unix"}, sockopt)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { l.Close() })
++	return l, path
++}
++
++func TestAHandedOverSocketIsTheClientItselfWithItsBytesUnread(t *testing.T) {
++	l, path := listen(t, nil)
++	client, server := tcpPair(t)
++	defer client.Close()
++	hello := "\x16\x03\x01 hello"
++	if _, err := client.Write([]byte(hello)); err != nil { // sent before the handoff
++		t.Fatal(err)
++	}
++	handOver(t, path, server)
++	conn, err := l.Accept()
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer conn.Close()
++	if _, ok := conn.(*net.TCPConn); !ok {
++		t.Fatalf("accepted %T, want *net.TCPConn", conn)
++	}
++	if conn.RemoteAddr().String() != client.LocalAddr().String() {
++		t.Fatalf("RemoteAddr %v, want the client %v", conn.RemoteAddr(), client.LocalAddr())
++	}
++	conn.SetDeadline(time.Now().Add(5 * time.Second))
++	client.SetDeadline(time.Now().Add(5 * time.Second))
++	got := make([]byte, len(hello))
++	if _, err := io.ReadFull(conn, got); err != nil || string(got) != hello {
++		t.Fatalf("read %q %v", got, err)
++	}
++	if _, err := conn.Write([]byte("answer")); err != nil {
++		t.Fatal(err)
++	}
++	back := make([]byte, 6)
++	if _, err := io.ReadFull(client, back); err != nil || string(back) != "answer" {
++		t.Fatalf("client read %q %v", back, err)
++	}
++}
++
++func TestAHandoffListenerRefusesThePROXYProtocol(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "p"+internet.HandoffSuffix)
++	_, err := internet.ListenSystem(context.Background(), &net.UnixAddr{Name: path, Net: "unix"},
++		&internet.SocketConfig{AcceptProxyProtocol: true})
++	if err == nil {
++		t.Fatal("a handoff listener accepted acceptProxyProtocol")
++	}
++	l, err := internet.ListenSystem(context.Background(), &net.UnixAddr{Name: path, Net: "unix"}, nil)
++	if err != nil {
++		t.Fatalf("the refused listen kept its lock: %v", err)
++	}
++	l.Close()
++}
++
++func TestManyClientsArriveInOrderAndASlowAcceptHoldsTheSender(t *testing.T) {
++	l, path := listen(t, nil)
++	d, err := net.DialUnix("unixpacket", nil, &net.UnixAddr{Name: path, Net: "unixpacket"})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer d.Close()
++	var clients []net.Conn
++	sent := make(chan int, 1)
++	go func() {
++		n := 0
++		for i := 0; i < 300; i++ {
++			client, server := tcpPair(t)
++			clients = append(clients, client)
++			f, _ := server.File()
++			if _, _, err := d.WriteMsgUnix([]byte{0}, syscall.UnixRights(int(f.Fd())), nil); err != nil {
++				break
++			}
++			f.Close()
++			server.Close()
++			n++
++		}
++		sent <- n
++	}()
++	time.Sleep(300 * time.Millisecond) // nobody accepts: the backlog fills and the sender waits, nothing is lost
++	for i := 0; i < 300; i++ {
++		conn, err := l.Accept()
++		if err != nil {
++			t.Fatal(err)
++		}
++		conn.Close()
++	}
++	if n := <-sent; n != 300 {
++		t.Fatalf("sent %d", n)
++	}
++	for _, c := range clients {
++		c.Close()
++	}
++}
++
++func TestCloseEndsAcceptAndFreesThePath(t *testing.T) {
++	l, path := listen(t, nil)
++	errc := make(chan error, 1)
++	go func() { _, err := l.Accept(); errc <- err }()
++	time.Sleep(50 * time.Millisecond)
++	l.Close()
++	select {
++	case err := <-errc:
++		if !errors.Is(err, net.ErrClosed) {
++			t.Fatalf("Accept after Close: %v", err)
++		}
++	case <-time.After(2 * time.Second):
++		t.Fatal("Accept did not return after Close")
++	}
++	again, err := internet.ListenSystem(context.Background(), &net.UnixAddr{Name: path, Net: "unix"}, nil)
++	if err != nil {
++		t.Fatalf("listen again on the same path: %v", err)
++	}
++	again.Close()
++}
++
++func TestAnythingButATCPSocketIsClosedNotAccepted(t *testing.T) {
++	l, path := listen(t, nil)
++	d, err := net.DialUnix("unixpacket", nil, &net.UnixAddr{Name: path, Net: "unixpacket"})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer d.Close()
++	r, w, _ := os.Pipe()
++	defer r.Close()
++	defer w.Close()
++	if _, _, err := d.WriteMsgUnix([]byte{0}, syscall.UnixRights(int(r.Fd())), nil); err != nil {
++		t.Fatal(err)
++	}
++	client, server := tcpPair(t)
++	defer client.Close()
++	handOver(t, path, server)
++	conn, err := l.Accept()
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer conn.Close()
++	if conn.RemoteAddr().String() != client.LocalAddr().String() {
++		t.Fatalf("the pipe was accepted, or the TCP client lost: %v", conn.RemoteAddr())
++	}
++}
+diff --git a/transport/internet/handoff_listener_other.go b/transport/internet/handoff_listener_other.go
+new file mode 100644
+index 0000000..361e6f1
+--- /dev/null
++++ b/transport/internet/handoff_listener_other.go
+@@ -0,0 +1,20 @@
++//go:build !linux
++
++package internet
++
++import (
++	"net"
++	"os"
++	"strings"
++
++	"github.com/xtls/xray-core/common/errors"
++)
++
++// HandoffSuffix marks a unix listen path that receives TCP sockets handed over by a dispatcher (Linux only).
++const HandoffSuffix = ".handoff"
++
++func isHandoffPath(address string) bool { return strings.HasSuffix(address, HandoffSuffix) }
++
++func listenHandoff(address string, perm *os.FileMode, locker *FileLocker) (net.Listener, error) {
++	return nil, errors.New("handoff listeners need Linux: ", address)
++}
+diff --git a/transport/internet/system_listener.go b/transport/internet/system_listener.go
+index b651796..ee1c320 100644
+--- a/transport/internet/system_listener.go
++++ b/transport/internet/system_listener.go
+@@ -145,6 +145,19 @@ func (dl *DefaultListener) Listen(ctx context.Context, addr net.Addr, sockopt *S
+ 			if err := locker.Acquire(); err != nil {
+ 				return nil, err
+ 			}
++			if isHandoffPath(address) {
++				// The clients are handed-over TCP sockets with the real peer: there is no proxy, so a PROXY
++				// header would never come; refuse the combination rather than wait for it on every connection.
++				if sockopt != nil && sockopt.AcceptProxyProtocol {
++					locker.Release()
++					return nil, errors.New("a handoff listener cannot accept the PROXY protocol: ", address)
++				}
++				l, err = listenHandoff(address, filePerm, locker)
++				if err != nil {
++					locker.Release()
++				}
++				return l, err
++			}
+ 
+ 			// set callback to combine listener and set permission
+ 			callback = func(l net.Listener, err error) (net.Listener, error) {
+-- 
+2.47.3
+

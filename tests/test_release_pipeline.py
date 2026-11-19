@@ -55,7 +55,15 @@ class ReleasePipelineTests(unittest.TestCase):
 
     def test_repository_patch_set_is_exact_and_stable(self) -> None:
         rows = release_pipeline.read_patch_rows(ROOT)
-        self.assertEqual(len(rows), 3)
+        self.assertEqual(
+            [row["name"] for row in rows],
+            [
+                "0001-Interrupt-active-VLESS-sessions-on-user-removal.patch",
+                "0002-Interrupt-active-Trojan-sessions-on-user-removal.patch",
+                "0003-Interrupt-all-managed-Xray-user-sessions.patch",
+                "0004-Accept-client-sockets-handed-over-by-the-443-dispatcher.patch",
+            ],
+        )
         self.assertRegex(release_pipeline.patchset_sha256(rows), r"^[0-9a-f]{64}$")
 
     def test_http_requests_identify_the_release_robot_with_project_contact(self) -> None:
