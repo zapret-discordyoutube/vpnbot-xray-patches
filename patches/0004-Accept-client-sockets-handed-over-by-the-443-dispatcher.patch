@@ -1,73 +1,112 @@
-From 46afea3ec7eb400498d3f7b78a735c4db7251941 Mon Sep 17 00:00:00 2001
+From 514a83a80715828e6c0126417f5681c8080d96c1 Mon Sep 17 00:00:00 2001
 From: loop-uh <loop-uh@users.noreply.github.com>
 Date: Thu, 19 Nov 2026 15:40:45 -0500
 Subject: [PATCH] Accept client sockets handed over by the node's 443
  dispatcher
 
-A unix listen path ending in .handoff is a SOCK_SEQPACKET listener whose
-clients are TCP sockets passed with SCM_RIGHTS by the node's 443
-dispatcher (vpnbot node-services go/cmd/sni-dispatch). The dispatcher
-peeks the ClientHello without consuming it, picks the inbound by SNI and
-hands over the client socket itself, so the inbound reads the untouched
-ClientHello, sees the real client address and no proxy stays in the data
-path. Accept returns *net.TCPConn; anything else received is closed; a
-full backlog holds the sender (backpressure); Close ends Accept with
-net.ErrClosed and frees the path. acceptProxyProtocol is refused on such a
-path: there is no proxy, so there is no header.
+When the node sets XRAY_VPNBOT_HANDOFF_DIR, every raw-TCP inbound that
+listens on an IPv4 loopback address keeps its TCP listener and also
+takes client sockets on <dir>/<port>.handoff: a SOCK_SEQPACKET socket
+whose messages carry TCP sockets passed with SCM_RIGHTS by the node's
+443 dispatcher (vpnbot node-services go/cmd/sni-dispatch). The
+dispatcher peeks the ClientHello without consuming it, picks the inbound
+by SNI and hands over the client socket itself, so the inbound reads the
+untouched ClientHello, sees the real client address and no proxy stays
+in the data path.
 
-Capability marker: vpnbot-socket-handoff-v1.
+Both listeners feed the same TLS/REALITY handling and handler. The TCP
+listener is exactly as configured, so local probes and the dispatcher's
+copy path keep reaching the inbound there, and its PROXY wrapper never
+sees a handed-over socket: there is no proxy in front of one, so there
+is no header. Anything received that is not a TCP socket is closed; a
+full backlog holds the sender (backpressure); Close ends both and frees
+the path. Without the directory nothing changes.
+
+Capability marker: vpnbot-socket-handoff-v2 (v1 meant a listen path
+ending in .handoff instead of TCP; no node used it).
 ---
  core/core.go                                  |   1 +
- transport/internet/handoff_listener_linux.go  | 194 +++++++++++++++++
- .../internet/handoff_listener_linux_test.go   | 201 ++++++++++++++++++
- transport/internet/handoff_listener_other.go  |  20 ++
- transport/internet/system_listener.go         |  13 ++
- 5 files changed, 429 insertions(+)
+ transport/internet/handoff_listener_linux.go  | 217 ++++++++++++++++++
+ .../internet/handoff_listener_linux_test.go   | 214 +++++++++++++++++
+ transport/internet/handoff_listener_other.go  |  11 +
+ transport/internet/tcp/hub.go                 |  29 ++-
+ .../internet/tcp/hub_handoff_linux_test.go    | 135 +++++++++++
+ 6 files changed, 603 insertions(+), 4 deletions(-)
  create mode 100644 transport/internet/handoff_listener_linux.go
  create mode 100644 transport/internet/handoff_listener_linux_test.go
  create mode 100644 transport/internet/handoff_listener_other.go
+ create mode 100644 transport/internet/tcp/hub_handoff_linux_test.go
 
 diff --git a/core/core.go b/core/core.go
-index d96644c..572358f 100644
+index d96644c..be8ecdc 100644
 --- a/core/core.go
 +++ b/core/core.go
 @@ -72,5 +72,6 @@ func VersionStatement() []string {
  		"VPnBot capability: vpnbot-active-revoke-v2",
  		"VPnBot capability: vpnbot-active-revoke-v3",
  		"VPnBot capability: vpnbot-live-user-audit-v1",
-+		"VPnBot capability: vpnbot-socket-handoff-v1",
++		"VPnBot capability: vpnbot-socket-handoff-v2",
  	}
  }
 diff --git a/transport/internet/handoff_listener_linux.go b/transport/internet/handoff_listener_linux.go
 new file mode 100644
-index 0000000..353e3aa
+index 0000000..c836cf3
 --- /dev/null
 +++ b/transport/internet/handoff_listener_linux.go
-@@ -0,0 +1,194 @@
+@@ -0,0 +1,217 @@
 +//go:build linux
 +
 +package internet
 +
 +import (
 +	"context"
++	"fmt"
 +	"net"
 +	"os"
-+	"strings"
++	"path/filepath"
 +	"sync"
 +	"syscall"
 +
 +	"github.com/xtls/xray-core/common/errors"
 +)
 +
-+// HandoffSuffix marks a unix listen path whose clients are TCP sockets handed over by the node's 443
-+// dispatcher, not unix connections: the dispatcher peeks the ClientHello (nothing is consumed), picks the
-+// inbound by its SNI and passes the client socket itself over a SOCK_SEQPACKET socket (SCM_RIGHTS).
-+// The inbound then owns an ordinary TCP connection: the untouched ClientHello is the first thing it
-+// reads, RemoteAddr is the real client, and no proxy sits in the data path. A handoff inbound must not
-+// set acceptProxyProtocol: there is no proxy, so there is no header.
++// HandoffDirEnv names the directory where every raw-TCP inbound listening on an IPv4 loopback address also
++// takes client sockets handed over by the node's 443 dispatcher: <dir>/<port>.handoff, a SOCK_SEQPACKET
++// socket whose messages carry the client socket itself (SCM_RIGHTS). The dispatcher peeks the ClientHello
++// (nothing is consumed) and picks the inbound by its SNI, so the inbound reads the untouched ClientHello,
++// RemoteAddr is the real client, and no proxy sits in the data path. The TCP listener stays exactly as
++// configured, so local probes and the dispatcher's copy path keep reaching the inbound there; unset, nothing
++// changes.
++const HandoffDirEnv = "XRAY_VPNBOT_HANDOFF_DIR"
++
++// HandoffSuffix ends every handoff path.
 +const HandoffSuffix = ".handoff"
 +
-+func isHandoffPath(address string) bool { return strings.HasSuffix(address, HandoffSuffix) }
++// HandoffPath is where the inbound listening on 127.0.0.1:port takes handed-over sockets.
++func HandoffPath(dir string, port int) string {
++	return filepath.Join(dir, fmt.Sprintf("%d%s", port, HandoffSuffix))
++}
++
++// ListenHandoffBeside opens the handoff listener of a TCP listener on addr, or returns nil when there is none:
++// the directory is not set, or addr is not an IPv4 loopback address with a port. Handed-over sockets never
++// pass the TCP listener's PROXY wrapper: there is no proxy in front of them, so there is no header.
++func ListenHandoffBeside(addr *net.TCPAddr) (net.Listener, error) {
++	dir := os.Getenv(HandoffDirEnv)
++	if dir == "" || addr == nil || addr.Port == 0 || addr.IP.To4() == nil || !addr.IP.IsLoopback() {
++		return nil, nil
++	}
++	path := HandoffPath(dir, addr.Port)
++	locker := &FileLocker{path: path + ".lock"}
++	if err := locker.Acquire(); err != nil {
++		return nil, err
++	}
++	l, err := listenHandoff(path, locker)
++	if err != nil {
++		locker.Release()
++		return nil, err
++	}
++	return l, nil
++}
 +
 +// handoffBacklog bounds the sockets received but not yet accepted. When it is full the reader stops
 +// reading, the dispatcher's sends block, and the dispatcher queues: backpressure end to end.
@@ -86,7 +125,7 @@ index 0000000..353e3aa
 +	peers  map[*net.UnixConn]struct{}
 +}
 +
-+func listenHandoff(address string, perm *os.FileMode, locker *FileLocker) (net.Listener, error) {
++func listenHandoff(address string, locker *FileLocker) (*handoffListener, error) {
 +	// The lock is held, so a socket file left at the path belongs to no running listener.
 +	if err := os.Remove(address); err != nil && !os.IsNotExist(err) {
 +		return nil, errors.New("failed to remove the stale handoff socket ", address).Base(err)
@@ -94,12 +133,6 @@ index 0000000..353e3aa
 +	unix, err := net.ListenUnix("unixpacket", &net.UnixAddr{Name: address, Net: "unixpacket"})
 +	if err != nil {
 +		return nil, err
-+	}
-+	if perm != nil {
-+		if err := os.Chmod(address, *perm); err != nil {
-+			unix.Close()
-+			return nil, errors.New("failed to set permission for ", address).Base(err)
-+		}
 +	}
 +	l := &handoffListener{
 +		unix:   unix,
@@ -240,16 +273,15 @@ index 0000000..353e3aa
 +func (l *handoffListener) Addr() net.Addr { return l.unix.Addr() }
 diff --git a/transport/internet/handoff_listener_linux_test.go b/transport/internet/handoff_listener_linux_test.go
 new file mode 100644
-index 0000000..0b0019e
+index 0000000..2275f9b
 --- /dev/null
 +++ b/transport/internet/handoff_listener_linux_test.go
-@@ -0,0 +1,201 @@
+@@ -0,0 +1,214 @@
 +//go:build linux
 +
 +package internet_test
 +
 +import (
-+	"context"
 +	"errors"
 +	"io"
 +	"net"
@@ -299,19 +331,26 @@ index 0000000..0b0019e
 +	return client, s.(*net.TCPConn)
 +}
 +
-+func listen(t *testing.T, sockopt *internet.SocketConfig) (net.Listener, string) {
++// listen opens the handoff listener beside an inbound on 127.0.0.1:port, with the node's directory set.
++func listen(t *testing.T) (net.Listener, string) {
 +	t.Helper()
-+	path := filepath.Join(t.TempDir(), "inbound"+internet.HandoffSuffix)
-+	l, err := internet.ListenSystem(context.Background(), &net.UnixAddr{Name: path, Net: "unix"}, sockopt)
-+	if err != nil {
-+		t.Fatal(err)
++	dir := t.TempDir()
++	t.Setenv(internet.HandoffDirEnv, dir)
++	addr := &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 20443}
++	l, err := internet.ListenHandoffBeside(addr)
++	if err != nil || l == nil {
++		t.Fatalf("ListenHandoffBeside = %v, %v", l, err)
 +	}
 +	t.Cleanup(func() { l.Close() })
++	path := internet.HandoffPath(dir, addr.Port)
++	if path != filepath.Join(dir, "20443.handoff") {
++		t.Fatalf("path %s", path)
++	}
 +	return l, path
 +}
 +
 +func TestAHandedOverSocketIsTheClientItselfWithItsBytesUnread(t *testing.T) {
-+	l, path := listen(t, nil)
++	l, path := listen(t)
 +	client, server := tcpPair(t)
 +	defer client.Close()
 +	hello := "\x16\x03\x01 hello"
@@ -345,22 +384,29 @@ index 0000000..0b0019e
 +	}
 +}
 +
-+func TestAHandoffListenerRefusesThePROXYProtocol(t *testing.T) {
-+	path := filepath.Join(t.TempDir(), "p"+internet.HandoffSuffix)
-+	_, err := internet.ListenSystem(context.Background(), &net.UnixAddr{Name: path, Net: "unix"},
-+		&internet.SocketConfig{AcceptProxyProtocol: true})
-+	if err == nil {
-+		t.Fatal("a handoff listener accepted acceptProxyProtocol")
++// Only an inbound on an IPv4 loopback address, with a port, on a node that set the directory, gets one: an
++// unset directory changes nothing, and a public or IPv6 listener is never a dispatcher backend.
++func TestAHandoffListenerIsOnlyBesideAnIPv4LoopbackInboundOfANodeThatAsksForIt(t *testing.T) {
++	t.Setenv(internet.HandoffDirEnv, "")
++	if l, err := internet.ListenHandoffBeside(&net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 20443}); l != nil || err != nil {
++		t.Fatalf("no directory: %v, %v", l, err)
 +	}
-+	l, err := internet.ListenSystem(context.Background(), &net.UnixAddr{Name: path, Net: "unix"}, nil)
-+	if err != nil {
-+		t.Fatalf("the refused listen kept its lock: %v", err)
++	dir := t.TempDir()
++	t.Setenv(internet.HandoffDirEnv, dir)
++	for _, addr := range []*net.TCPAddr{
++		{IP: net.IPv4zero, Port: 20443}, {IP: net.IPv6loopback, Port: 20443}, {IP: net.IPv4(127, 0, 0, 1), Port: 0},
++	} {
++		if l, err := internet.ListenHandoffBeside(addr); l != nil || err != nil {
++			t.Fatalf("%v: %v, %v", addr, l, err)
++		}
 +	}
-+	l.Close()
++	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
++		t.Fatalf("files left: %v", entries)
++	}
 +}
 +
 +func TestManyClientsArriveInOrderAndASlowAcceptHoldsTheSender(t *testing.T) {
-+	l, path := listen(t, nil)
++	l, path := listen(t)
 +	d, err := net.DialUnix("unixpacket", nil, &net.UnixAddr{Name: path, Net: "unixpacket"})
 +	if err != nil {
 +		t.Fatal(err)
@@ -400,7 +446,7 @@ index 0000000..0b0019e
 +}
 +
 +func TestCloseEndsAcceptAndFreesThePath(t *testing.T) {
-+	l, path := listen(t, nil)
++	l, path := listen(t)
 +	errc := make(chan error, 1)
 +	go func() { _, err := l.Accept(); errc <- err }()
 +	time.Sleep(50 * time.Millisecond)
@@ -413,15 +459,15 @@ index 0000000..0b0019e
 +	case <-time.After(2 * time.Second):
 +		t.Fatal("Accept did not return after Close")
 +	}
-+	again, err := internet.ListenSystem(context.Background(), &net.UnixAddr{Name: path, Net: "unix"}, nil)
-+	if err != nil {
-+		t.Fatalf("listen again on the same path: %v", err)
++	again, err := internet.ListenHandoffBeside(&net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 20443})
++	if err != nil || again == nil {
++		t.Fatalf("listen again on the same path %s: %v", path, err)
 +	}
 +	again.Close()
 +}
 +
 +func TestAnythingButATCPSocketIsClosedNotAccepted(t *testing.T) {
-+	l, path := listen(t, nil)
++	l, path := listen(t)
 +	d, err := net.DialUnix("unixpacket", nil, &net.UnixAddr{Name: path, Net: "unixpacket"})
 +	if err != nil {
 +		t.Fatal(err)
@@ -447,54 +493,227 @@ index 0000000..0b0019e
 +}
 diff --git a/transport/internet/handoff_listener_other.go b/transport/internet/handoff_listener_other.go
 new file mode 100644
-index 0000000..361e6f1
+index 0000000..07c57e6
 --- /dev/null
 +++ b/transport/internet/handoff_listener_other.go
-@@ -0,0 +1,20 @@
+@@ -0,0 +1,11 @@
 +//go:build !linux
 +
 +package internet
 +
-+import (
-+	"net"
-+	"os"
-+	"strings"
++import "net"
 +
-+	"github.com/xtls/xray-core/common/errors"
++// HandoffDirEnv names the directory of handoff sockets (Linux only; see handoff_listener_linux.go).
++const HandoffDirEnv = "XRAY_VPNBOT_HANDOFF_DIR"
++
++// ListenHandoffBeside: handed-over sockets need Linux (SCM_RIGHTS of TCP sockets); elsewhere there is none.
++func ListenHandoffBeside(addr *net.TCPAddr) (net.Listener, error) { return nil, nil }
+diff --git a/transport/internet/tcp/hub.go b/transport/internet/tcp/hub.go
+index 92eb6e6..7c9d057 100644
+--- a/transport/internet/tcp/hub.go
++++ b/transport/internet/tcp/hub.go
+@@ -19,6 +19,7 @@ import (
+ // Listener is an internet.Listener that listens for TCP connections.
+ type Listener struct {
+ 	listener      net.Listener
++	handoff       net.Listener // sockets handed over by the node's 443 dispatcher, beside listener; nil = none
+ 	tlsConfig     *gotls.Config
+ 	realityConfig *goreality.Config
+ 	authConfig    internet.ConnectionAuthenticator
+@@ -62,6 +63,17 @@ func ListenTCP(ctx context.Context, address net.Address, port net.Port, streamSe
+ 	}
+ 
+ 	l.listener = listener
++	if tcpAddr, isTCP := addr.(*net.TCPAddr); isTCP && streamSettings.FinalMask == nil {
++		handoff, err := internet.ListenHandoffBeside(tcpAddr)
++		if err != nil {
++			listener.Close()
++			return nil, errors.New("failed to take handed-over sockets beside ", address, ":", port).Base(err)
++		}
++		if handoff != nil {
++			l.handoff = handoff
++			errors.LogInfo(ctx, "taking handed-over sockets on ", handoff.Addr())
++		}
++	}
+ 
+ 	if config := tls.ConfigFromStreamSettings(streamSettings); config != nil {
+ 		l.tlsConfig = config.GetTLSConfig()
+@@ -83,13 +95,16 @@ func ListenTCP(ctx context.Context, address net.Address, port net.Port, streamSe
+ 		l.authConfig = auth
+ 	}
+ 
+-	go l.keepAccepting()
++	go l.keepAccepting(l.listener)
++	if l.handoff != nil {
++		go l.keepAccepting(l.handoff) // the same TLS/REALITY and handler: the client is the same either way
++	}
+ 	return l, nil
+ }
+ 
+-func (v *Listener) keepAccepting() {
++func (v *Listener) keepAccepting(listener net.Listener) {
+ 	for {
+-		conn, err := v.listener.Accept()
++		conn, err := listener.Accept()
+ 		if err != nil {
+ 			errStr := err.Error()
+ 			if strings.Contains(errStr, "closed") {
+@@ -126,7 +141,13 @@ func (v *Listener) Addr() net.Addr {
+ 
+ // Close implements internet.Listener.Close.
+ func (v *Listener) Close() error {
+-	return v.listener.Close()
++	err := v.listener.Close()
++	if v.handoff != nil {
++		if herr := v.handoff.Close(); err == nil {
++			err = herr
++		}
++	}
++	return err
+ }
+ 
+ func init() {
+diff --git a/transport/internet/tcp/hub_handoff_linux_test.go b/transport/internet/tcp/hub_handoff_linux_test.go
+new file mode 100644
+index 0000000..da360a0
+--- /dev/null
++++ b/transport/internet/tcp/hub_handoff_linux_test.go
+@@ -0,0 +1,135 @@
++//go:build linux
++
++package tcp_test
++
++import (
++	"context"
++	"io"
++	gonet "net"
++	"strconv"
++	"syscall"
++	"testing"
++	"time"
++
++	"github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/transport/internet"
++	"github.com/xtls/xray-core/transport/internet/stat"
++	. "github.com/xtls/xray-core/transport/internet/tcp"
 +)
 +
-+// HandoffSuffix marks a unix listen path that receives TCP sockets handed over by a dispatcher (Linux only).
-+const HandoffSuffix = ".handoff"
-+
-+func isHandoffPath(address string) bool { return strings.HasSuffix(address, HandoffSuffix) }
-+
-+func listenHandoff(address string, perm *os.FileMode, locker *FileLocker) (net.Listener, error) {
-+	return nil, errors.New("handoff listeners need Linux: ", address)
++func freePort(t *testing.T) int {
++	t.Helper()
++	l, err := gonet.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer l.Close()
++	return l.Addr().(*gonet.TCPAddr).Port
 +}
-diff --git a/transport/internet/system_listener.go b/transport/internet/system_listener.go
-index b651796..ee1c320 100644
---- a/transport/internet/system_listener.go
-+++ b/transport/internet/system_listener.go
-@@ -145,6 +145,19 @@ func (dl *DefaultListener) Listen(ctx context.Context, addr net.Addr, sockopt *S
- 			if err := locker.Acquire(); err != nil {
- 				return nil, err
- 			}
-+			if isHandoffPath(address) {
-+				// The clients are handed-over TCP sockets with the real peer: there is no proxy, so a PROXY
-+				// header would never come; refuse the combination rather than wait for it on every connection.
-+				if sockopt != nil && sockopt.AcceptProxyProtocol {
-+					locker.Release()
-+					return nil, errors.New("a handoff listener cannot accept the PROXY protocol: ", address)
-+				}
-+				l, err = listenHandoff(address, filePerm, locker)
-+				if err != nil {
-+					locker.Release()
-+				}
-+				return l, err
-+			}
- 
- 			// set callback to combine listener and set permission
- 			callback = func(l net.Listener, err error) (net.Listener, error) {
++
++func accepted(t *testing.T, conns chan stat.Connection) stat.Connection {
++	t.Helper()
++	select {
++	case c := <-conns:
++		c.SetDeadline(time.Now().Add(5 * time.Second))
++		return c
++	case <-time.After(5 * time.Second):
++		t.Fatal("the inbound got no connection")
++		return nil
++	}
++}
++
++func readString(t *testing.T, c gonet.Conn, n int) string {
++	t.Helper()
++	got := make([]byte, n)
++	if _, err := io.ReadFull(c, got); err != nil {
++		t.Fatalf("read: %v", err)
++	}
++	return string(got)
++}
++
++// One inbound, two ways in: its TCP listener keeps reading the PROXY header the dispatcher's copy path sends,
++// and a socket handed over beside it reaches the same handler with no header and its real peer.
++func TestAnInboundTakesHandedOverSocketsBesideItsPROXYListener(t *testing.T) {
++	dir := t.TempDir()
++	t.Setenv(internet.HandoffDirEnv, dir)
++	port := freePort(t)
++	settings := &internet.MemoryStreamConfig{
++		ProtocolName: "tcp", ProtocolSettings: &Config{},
++		SocketSettings: &internet.SocketConfig{AcceptProxyProtocol: true},
++	}
++	conns := make(chan stat.Connection, 4)
++	l, err := ListenTCP(context.Background(), net.LocalHostIP, net.Port(port), settings, func(c stat.Connection) { conns <- c })
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	viaTCP, err := gonet.Dial("tcp", gonet.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer viaTCP.Close()
++	if _, err := viaTCP.Write([]byte("PROXY TCP4 203.0.113.7 127.0.0.1 40000 443\r\none")); err != nil {
++		t.Fatal(err)
++	}
++	first := accepted(t, conns)
++	if got := readString(t, first, 3); got != "one" {
++		t.Fatalf("via TCP read %q", got)
++	}
++	if first.RemoteAddr().String() != "203.0.113.7:40000" {
++		t.Fatalf("via TCP the peer is %v, want the PROXY header's", first.RemoteAddr())
++	}
++	first.Close()
++
++	client, server := clientPair(t)
++	defer client.Close()
++	if _, err := client.Write([]byte("two")); err != nil {
++		t.Fatal(err)
++	}
++	d, err := gonet.DialUnix("unixpacket", nil, &gonet.UnixAddr{Name: internet.HandoffPath(dir, port), Net: "unixpacket"})
++	if err != nil {
++		t.Fatal(err)
++	}
++	f, _ := server.File()
++	if _, _, err := d.WriteMsgUnix([]byte{0}, syscall.UnixRights(int(f.Fd())), nil); err != nil {
++		t.Fatal(err)
++	}
++	f.Close()
++	server.Close()
++	d.Close()
++	second := accepted(t, conns)
++	if got := readString(t, second, 3); got != "two" {
++		t.Fatalf("handed over read %q", got)
++	}
++	if second.RemoteAddr().String() != client.LocalAddr().String() {
++		t.Fatalf("handed over the peer is %v, want the client %v", second.RemoteAddr(), client.LocalAddr())
++	}
++	second.Close()
++
++	if err := l.Close(); err != nil {
++		t.Fatal(err)
++	}
++	again, err := internet.ListenHandoffBeside(&gonet.TCPAddr{IP: gonet.IPv4(127, 0, 0, 1), Port: port})
++	if err != nil || again == nil {
++		t.Fatalf("Close kept the handoff path: %v", err)
++	}
++	again.Close()
++}
++
++func clientPair(t *testing.T) (gonet.Conn, *gonet.TCPConn) {
++	t.Helper()
++	l, err := gonet.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer l.Close()
++	client, err := gonet.Dial("tcp", l.Addr().String())
++	if err != nil {
++		t.Fatal(err)
++	}
++	s, err := l.Accept()
++	if err != nil {
++		t.Fatal(err)
++	}
++	return client, s.(*gonet.TCPConn)
++}
 -- 
 2.47.3
 

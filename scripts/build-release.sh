@@ -100,7 +100,7 @@ build_target() {
             || fail "the built Xray binary does not expose the v3 capability marker"
         [[ "$version_statement" == *'VPnBot capability: vpnbot-live-user-audit-v1'* ]] \
             || fail "the built Xray binary does not expose the live-user-audit marker"
-        [[ "$version_statement" == *'VPnBot capability: vpnbot-socket-handoff-v1'* ]] \
+        [[ "$version_statement" == *'VPnBot capability: vpnbot-socket-handoff-v2'* ]] \
             || fail "the built Xray binary does not expose the socket-handoff marker"
     fi
     cp -- "${SOURCE_DIRECTORY}/README.md" "${package_directory}/README.md"

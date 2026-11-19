@@ -83,7 +83,7 @@ grep -Fq 'vpnbot-active-revoke-v3' "${DESTINATION}/VPNBOT_ACTIVE_REVOKE.md" \
     || fail "the active-revocation capability marker is missing"
 grep -Fq 'VPnBot capability: vpnbot-active-revoke-v3' "${DESTINATION}/core/core.go" \
     || fail "the runtime capability marker is missing"
-grep -Fq 'VPnBot capability: vpnbot-socket-handoff-v1' "${DESTINATION}/core/core.go" \
+grep -Fq 'VPnBot capability: vpnbot-socket-handoff-v2' "${DESTINATION}/core/core.go" \
     || fail "the socket-handoff capability marker is missing"
 grep -Fq 'vpnbot-live-user-audit-v1' "${DESTINATION}/VPNBOT_ACTIVE_REVOKE.md" \
     || fail "the live-user-audit capability documentation is missing"
@@ -94,4 +94,4 @@ grep -Fq 'cmdVPnBotLiveUserAudit' "${DESTINATION}/main/commands/all/api/api.go" 
 git -C "$DESTINATION" diff --check "$XRAY_UPSTREAM_COMMIT..HEAD"
 
 printf 'Prepared official XTLS/Xray-core %s with VPnBot capabilities %s, %s and %s\n' \
-    "$XRAY_UPSTREAM_TAG" "vpnbot-active-revoke-v3" "vpnbot-live-user-audit-v1" "vpnbot-socket-handoff-v1"
+    "$XRAY_UPSTREAM_TAG" "vpnbot-active-revoke-v3" "vpnbot-live-user-audit-v1" "vpnbot-socket-handoff-v2"
